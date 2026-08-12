@@ -26,7 +26,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from 'schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync } from 'node:fs'
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -680,8 +680,53 @@ export function apply(ctx: AppContext, config: Config): void {
     return 'OK: 卸载完成\n- ' + steps.join('\n- ')
   }
 
-  /** 启动自动恢复：清单里的插件逐个重新注入（已加载的跳过）。 */
+  /** junction 健康检查：能读目录 = 目标可达（Windows 断电后悬空 junction 的 lstat 仍是链接但读目录抛错）。 */
+  function isHealthyLink(p: string): boolean {
+    try {
+      if (!lstatSync(p).isSymbolicLink()) return false
+      readdirSync(p)
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /** 启动自动恢复：① bundle junction 断电自愈（profile packages 的 link:）→ ② 注入清单逐个重新注入。 */
   async function restore(): Promise<void> {
+    // ① profile bundle junction 自愈：断电/强制关机后 junction 悬空 → 重建。
+    //    （dev_install_package 装的 bundle 在 profile package.json，junction 失效会导致装配失败——此前无覆盖，需手动修）
+    try {
+      const profileDir = dirname(config.profileNodeModules)
+      const profilePkg = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8'))
+      const bundles: string[] = profilePkg?.dsh?.profile?.bundles ?? []
+      const deps: Record<string, string> = profilePkg?.dependencies ?? {}
+      for (const name of bundles) {
+        const scope = name.startsWith('@') ? name.split('/')[0] : null
+        const linkDir = join(config.profileNodeModules, scope ?? '')
+        const linkPath = join(linkDir, scope ? name.split('/')[1] as string : name)
+        if (!isHealthyLink(linkPath)) {
+          const dep = deps[name] ?? ''
+          const target = dep.startsWith('link:') ? dep.slice(5) : ''
+          if (target && existsSync(target)) {
+            try {
+              if (existsSync(linkPath)) rmdirSync(linkPath)
+            } catch { /* 坏链接删除失败忽略 */ }
+            try {
+              mkdirSync(linkDir, { recursive: true })
+              symlinkSync(target, linkPath, 'junction')
+              logger.warn('[super-injector] 断电自愈：重建 junction %s → %s', name, target)
+            } catch (err) {
+              logger.warn('[super-injector] junction 重建失败 %s: %s', name, String(err))
+            }
+          } else {
+            logger.warn('[super-injector] bundle %s 的 junction 悬空且无有效 link: 目标', name)
+          }
+        }
+      }
+    } catch (err) {
+      logger.warn('[super-injector] bundle junction 自愈扫描失败: %s', String(err))
+    }
+    // ② 注入清单恢复（原逻辑）
     for (const e of readRegistry()) {
       try {
         if (hasActiveEntry(e.name)) continue
