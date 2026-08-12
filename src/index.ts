@@ -70,10 +70,23 @@ export function apply(ctx: AppContext, config: Config): void {
     writeFileSync(registryFile, JSON.stringify(list, null, 2), 'utf8')
   }
 
-  /** 该包目录是否已出现在模块缓存（防重复注入）。 */
-  function isLoaded(pkgDir: string): boolean {
-    const keys = [...ctx.loader.internal!.loadCache.keys()].map(String)
-    return keys.some(k => k.includes(pkgDir.replace(/\\/g, '/')))
+  /** 该包是否已有 ACTIVATE 的 loader entry（权威防重判断）。 */
+  function hasActiveEntry(pkgName: string): boolean {
+    for (const entry of ctx.loader.entries()) {
+      const opts = entry.options
+      if (opts.group) continue
+      if (opts.name === pkgName && entry.fiber && entry.fiber.state === 2) return true
+    }
+    return false
+  }
+
+  /** 清除某包目录的模块缓存残留（失败 import 留下的残缺 job 会毒化重试）。 */
+  function purgeCache(pkgDir: string): void {
+    const key = pkgDir.replace(/\\/g, '/')
+    const loadCache = ctx.loader.internal!.loadCache as Map<string, unknown>
+    for (const u of [...loadCache.keys()]) {
+      if (typeof u === 'string' && u.includes(key)) Map.prototype.delete.call(loadCache, u)
+    }
   }
 
   /** 注入一个本地插件包：junction → loader.create → 记录清单。 */
@@ -90,7 +103,8 @@ export function apply(ctx: AppContext, config: Config): void {
     const pkgName = pkg.name
     if (!pkgName) return 'ERROR: package.json 缺 name'
 
-    if (isLoaded(absDir)) return `INFO: ${pkgName} 已在运行（loadCache 命中），跳过注入`
+    if (hasActiveEntry(pkgName)) return `INFO: ${pkgName} 已激活运行，跳过注入`
+    purgeCache(absDir)
 
     // junction 链接到 profile node_modules（scoped 包需要两级目录）
     const scoped = pkgName.startsWith('@')
@@ -124,7 +138,7 @@ export function apply(ctx: AppContext, config: Config): void {
   async function restore(): Promise<void> {
     for (const e of readRegistry()) {
       try {
-        if (isLoaded(e.dir)) continue
+        if (hasActiveEntry(e.name)) continue
         await inject(e.dir)
         logger.info('[super-injector] 自动恢复 %s', e.name)
       } catch (err) {
