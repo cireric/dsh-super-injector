@@ -97,6 +97,17 @@ function fingerprintOf(dir: string): string | null {
   }
 }
 
+/**
+ * 操作互斥锁：注入/卸载/重载/安装全部串行执行（多会话并发调用注入器时，
+ * 后操作排队等前操作完成——避免同一插件被并发重载/卸载的竞态）。
+ */
+let opChain: Promise<unknown> = Promise.resolve()
+function withOpLock<T>(fn: () => Promise<T> | T): Promise<T> {
+  const run = opChain.then(() => fn(), () => fn())
+  opChain = run.then(() => undefined, () => undefined)
+  return run
+}
+
 export function apply(ctx: AppContext, config: Config): void {
   const logger = ctx.logger
   const registryFile = config.registryFile || join(homedir(), '.dsh', 'super-injector', 'registry.json')
@@ -200,6 +211,10 @@ export function apply(ctx: AppContext, config: Config): void {
             const fiber = entry.fiber
             if (fiber && typeof fiber === 'object') {
               // 尝试用新插件导出重建 fiber（entry 的 plugin 引用替换）
+              // ⚠️ 先 await 旧 fiber dispose（异步清理防注册竞态）
+              if (typeof fiber.dispose === 'function') {
+                try { await fiber.dispose() } catch { /* 忽略 */ }
+              }
               const registry = (ctx as any).registry
               if (registry && typeof registry.delete === 'function' && typeof registry.plugin === 'function') {
                 registry.delete(fiber)
@@ -264,6 +279,21 @@ export function apply(ctx: AppContext, config: Config): void {
     let rebuilt = 0
     try {
       const config = currentConfigOf(fibers[0]?._config)
+      // ⚠️ 竞态修复：cordis 的 fiber.dispose() 是异步清理（_unload await disposables，
+      // 含 context/tools 注册注销）——必须先 await 旧 fiber 完全 dispose，
+      // 再建新 fiber，否则新 fiber apply 时旧注册残留 → duplicate（此前 engram
+      // 重载连环 "already registered" 的根因）。registry.delete 是 fire-and-forget，
+      // 所以这里直接 await entry.fiber 的 dispose（返回 disposalTask Promise）。
+      const entryForDispose = [...ctx.loader.entries()].find((en) => {
+        const o = en.options as { name?: string }
+        return o?.name && String(o.name).includes(match)
+      })
+      const oldFiberEntry = entryForDispose?.fiber
+      if (oldFiberEntry && typeof oldFiberEntry.dispose === 'function') {
+        try {
+          await oldFiberEntry.dispose()
+        } catch { /* dispose 清理失败不阻塞重建 */ }
+      }
       ctx.registry.delete(oldPlugin)
       for (const oldFiber of fibers) {
         try {
@@ -647,7 +677,7 @@ export function apply(ctx: AppContext, config: Config): void {
     async execute(args: { dir: string }) {
       const dir = String(args.dir ?? '').trim()
       if (!dir) return 'ERROR: dir 必填（插件包目录绝对路径）'
-      return inject(dir)
+      return withOpLock(() => inject(dir))
     },
   }))
 
@@ -678,7 +708,7 @@ export function apply(ctx: AppContext, config: Config): void {
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
     async execute(args: { match: string }) {
-      return uninject(args.match)
+      return withOpLock(() => uninject(args.match))
     },
   }))
 
@@ -728,7 +758,7 @@ export function apply(ctx: AppContext, config: Config): void {
       }
       const entry = findEntry(args.packageName)
       const before = entry ? stateOf(entry) : '（未找到）'
-      const result = await reloadPackage(args.packageName)
+      const result = await withOpLock(() => reloadPackage(args.packageName!))
       const after = entry ? await waitFiberStable(entry) : '（未找到）'
       return result + '\n--- 重载前后状态 ---\nbefore: [' + before + ']\nafter: [' + after + ']'
     },
@@ -766,6 +796,7 @@ export function apply(ctx: AppContext, config: Config): void {
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
     async execute(args) {
+      return withOpLock(async () => {
       const dir = String(args.dir)
       const profileName = args.profile ? String(args.profile) : 'web'
       try {
@@ -819,8 +850,9 @@ export function apply(ctx: AppContext, config: Config): void {
 
         return 'OK: ' + name + ' 热装配完成\n- ' + steps.join('\n- ') + '\n（重启后由 bundles 列表正常装配，双路径一致；patch 层配置重启后接管）'
       } catch (e) {
-        return 'ERROR: ' + (e instanceof Error ? e.stack : String(e))
+        return 'ERROR: 安装失败: ' + String(e)
       }
+      })
     },
   }))
 
