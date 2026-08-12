@@ -233,7 +233,32 @@ export function apply(ctx: AppContext, config: Config): void {
     }
 
     const runtime = ctx.registry.get(oldPlugin)
-    if (!runtime) return 'ERROR: registry 中无该插件 runtime'
+    // registry 无 runtime（模块实例不匹配：watch/rescue 等路径建的 fiber 与
+    // oldJob namespace 不同）——不依赖 registry.get，直接 entry.fiber 重建。
+    if (!runtime) {
+      const target = [...ctx.loader.entries()].find((en) => {
+        const o = en.options as { name?: string }
+        return o?.name && String(o.name).includes(match)
+      })
+      if (target?.fiber) {
+        try {
+          if (typeof target.fiber.dispose === 'function') await target.fiber.dispose()
+          const backup2 = new Map<string, any>()
+          for (const u of urls) {
+            backup2.set(u, loadCache.get(u))
+            Map.prototype.delete.call(loadCache, u)
+          }
+          const fresh2 = ctx.loader.unwrapExports(await ctx.loader.import(entryUrl, () => []))
+          const nf2 = ctx.registry.plugin(fresh2, target.options.config ?? {}, () => [])
+          nf2.entry = target
+          target.fiber = nf2
+          return `OK: registry 无 runtime，entry.fiber 直接重建（state=${nf2.state}）`
+        } catch (e) {
+          return 'ERROR: entry 重建失败: ' + (e instanceof Error ? e.stack : String(e))
+        }
+      }
+      return 'ERROR: registry 中无该插件 runtime 且 entry 无 fiber'
+    }
 
     // 清缓存（备份以便回滚）
     const backup = new Map<string, any>()
