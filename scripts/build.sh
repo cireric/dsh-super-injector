@@ -42,6 +42,7 @@ link_pkg cordis vendor/cordis
 link_pkg cosmokit vendor/cosmokit
 link_pkg schemastery vendor/schemastery
 link_pkg @deepseek-ai/dsh-tools packages/core/tools
+link_pkg @deepseek-ai/dsh-system-prompt packages/core/system-prompt
 link_pkg @deepseek-ai/cordis-plugin-loader vendor/loader
 
 STD_SCHEMA=$(find "$CHECKOUT/node_modules/.pnpm" -maxdepth 1 -type d -iname '@standard-schema+spec@*' 2>/dev/null | head -1)
