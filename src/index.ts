@@ -141,6 +141,23 @@ export function apply(ctx: AppContext, config: Config): void {
   }
 
   // ============ 热重载核心 ============
+  /** 按包名匹配清理 webserver 路由残留（强制登记守卫的自愈部分）。 */
+  function clearRoutesByMatch(match: string): string[] {
+    const hs = ctx.httpServer
+    const cleaned: string[] = []
+    for (const tableName of ['exact', 'prefixes', 'upgrades'] as const) {
+      const table = hs?.[tableName]
+      if (!table || typeof table.delete !== 'function') continue
+      for (const k of [...table.keys()]) {
+        if (String(k).includes(match)) {
+          table.delete(k)
+          cleaned.push(`${tableName}[${k}]`)
+        }
+      }
+    }
+    return cleaned
+  }
+
   /** 整包热重载：清缓存 → import → 重建 fiber，失败回滚保留旧代。 */
   async function reloadPackage(match: string): Promise<string> {
     const internal = ctx.loader.internal
@@ -224,7 +241,17 @@ export function apply(ctx: AppContext, config: Config): void {
           if (fiber.entry) fiber.entry.fiber = fiber
         }
       } catch { /* 尽力而为 */ }
-      return 'ERROR: 重建失败，已回滚（旧代保留）: ' + (e instanceof Error ? e.stack : String(e))
+      const message = String(e instanceof Error ? (e.stack ?? e.message) : e)
+      // 强制登记守卫：duplicate route = 旧 fiber 存在「未登记到 ctx.effect 的裸注册」，
+      // dispose 无法自动注销 → 新注册撞车。检测到即报错要求登记，并自动清理残留自愈。
+      if (message.includes('duplicate') || message.includes('already registered')) {
+        const cleaned = clearRoutesByMatch(match)
+        return 'ERROR: 检测到未登记的裸注册（' + (e instanceof Error ? e.message : String(e))
+          + '）——插件必须把资源注册挂到 ctx.effect（登记后 dispose 自动清理，热重载不再残留）。'
+          + '\n已自动清理疑似残留路由：' + (cleaned.length ? cleaned.join(', ') : '（无）')
+          + '\n请重载重试；若仍失败请检查插件源码中的裸注册。'
+      }
+      return 'ERROR: 重建失败，已回滚（旧代保留）: ' + message
     }
 
     if (failures.length) {
