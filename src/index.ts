@@ -26,7 +26,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from 'schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync } from 'node:fs'
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -321,6 +321,54 @@ export function apply(ctx: AppContext, config: Config): void {
     return `OK: ${pkgName} 已注入（junction=${linkDir}，entry 已装配）`
   }
 
+  /** 卸载一个已注入的插件包：卸 entry（fiber dispose）→ 清 registry → 删 junction。 */
+  async function uninject(match: string): Promise<string> {
+    if (match.includes('super-injector')) return 'ERROR: 拒绝卸载 dsh-super-injector 自身（引导器不可卸载）'
+    const steps: string[] = []
+    let fullName: string | null = null
+    // 1. loader entry 卸载（同时捕获完整包名）
+    for (const entry of ctx.loader.entries()) {
+      const opts = entry.options
+      if (opts.group) continue
+      if (!opts.name.includes(match)) continue
+      fullName = opts.name
+      try {
+        await entry.parent.remove(entry.id, true)
+        steps.push('entry 已卸载: ' + opts.name)
+      } catch (e) {
+        steps.push('entry 卸载失败: ' + String(e))
+      }
+    }
+    if (!steps.some(s => s.startsWith('entry 已卸载'))) steps.push('（无匹配 entry）')
+    // 2. registry 清理（按 name 或目录匹配）
+    const reg = readRegistry()
+    const hit = reg.find(e => e.name.includes(match) || e.dir.includes(match))
+    if (hit) fullName ??= hit.name
+    const after = reg.filter(e => !e.name.includes(match) && !e.dir.includes(match))
+    if (after.length !== reg.length) {
+      writeRegistry(after)
+      steps.push('registry 已清理')
+    }
+    // 3. junction 删除（用完整包名构建路径；rmdir 只删链接不删目标）
+    if (fullName) {
+      const parts = fullName.startsWith('@') ? fullName.split('/') : [fullName]
+      const linkDir = join(profileNodeModules, ...parts)
+      try {
+        if (existsSync(linkDir)) {
+          rmdirSync(linkDir)
+          steps.push('junction 已删除: ' + linkDir)
+        } else {
+          steps.push('（junction 不存在）')
+        }
+      } catch (e) {
+        steps.push('junction 删除失败: ' + String(e))
+      }
+    } else {
+      steps.push('（未找到完整包名，跳过 junction 清理）')
+    }
+    return 'OK: 卸载完成\n- ' + steps.join('\n- ')
+  }
+
   /** 启动自动恢复：清单里的插件逐个重新注入（已加载的跳过）。 */
   async function restore(): Promise<void> {
     for (const e of readRegistry()) {
@@ -396,6 +444,21 @@ export function apply(ctx: AppContext, config: Config): void {
       return list.length
         ? list.map(e => `- ${e.name} @ ${e.dir}（${e.at}）`).join('\n')
         : '（无注入记录）'
+    },
+  }))
+
+  safeRegister(defineTool({
+    name: 'dev_uninject_plugin',
+    description: '超级模组卸载器：卸载已注入的插件包——卸 loader entry（fiber dispose，工具/监听全清理）→ 清注入清单 → 删 profile junction，免重启。参数 = 包名子串（如 dsh-toy-supermod）',
+    parameters: {
+      match: { type: 'string', description: '包名/路径子串（如 dsh-toy-supermod 或 @dsh-external/dsh-toy-supermod）' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
+    },
+    async execute(args: { match: string }) {
+      return uninject(args.match)
     },
   }))
 
