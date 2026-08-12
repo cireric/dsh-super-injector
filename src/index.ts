@@ -285,6 +285,120 @@ export function apply(ctx: AppContext, config: Config): void {
     return undefined
   }
 
+  // ============ 开发侧挂区（staging）：测试工具挂后侧，转正才进 schema ============
+  // 任何工具增减都会改变 tools schema → DeepSeek 前缀缓存全灭 → 全量计费。
+  // 开发/审计工具一律挂"后侧"（staging）：不进 schema、缓存零污染，经
+  // dev_stage_call 测试；确认转正后 dev_stage_promote 一键挂"前侧"（正式注册，
+  // 仅承受这一次缓存刷新）。execute 为 JS 代码字符串（function(args, ctx){...}），
+  // 闭包可访问本插件的 ctx（httpServer/loader/timer/tools/systemPrompt）——仅限可信代码。
+  interface StagedTool {
+    description: string
+    parameters: Record<string, unknown>
+    execute: (args: Record<string, unknown>, c: any) => unknown | Promise<unknown>
+    promoted: boolean
+  }
+  const staged = new Map<string, StagedTool>()
+
+  safeRegister(defineTool({
+    name: 'dev_stage_add',
+    description: '开发侧挂：把测试/开发工具挂"后侧"（不进 tools schema、不污染缓存前缀），经 dev_stage_call 调用测试。execute 为 JS 代码字符串（function(args, ctx){...}），仅限可信代码。转正用 dev_stage_promote，丢弃用 dev_stage_demote。',
+    parameters: {
+      name: { type: 'string', required: true, description: '工具名（唯一）' },
+      description: { type: 'string', required: true, description: '工具描述' },
+      parameters: { type: 'json', description: '参数 schema（可选，留空则无参）' },
+      execute: { type: 'string', required: true, description: 'JS 代码：function(args, ctx){ return ... }' },
+    },
+    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
+    async execute(args: any) {
+      if (!args.name || !/^[a-zA-Z0-9_-]+$/.test(args.name)) return 'ERROR: name 缺失或含非法字符'
+      if (staged.has(args.name)) return `ERROR: staging 已存在同名工具（${args.name}），先 dev_stage_demote 或换个名`
+      let fn: Function
+      try {
+        fn = new Function('args', 'ctx', `return (${args.execute})(args, ctx)`)
+      } catch (e) {
+        return 'ERROR: execute 代码编译失败: ' + String(e)
+      }
+      staged.set(args.name, {
+        description: String(args.description ?? ''),
+        parameters: (args.parameters && typeof args.parameters === 'object') ? args.parameters : {},
+        execute: fn as StagedTool['execute'],
+        promoted: false,
+      })
+      return `OK: ${args.name} 已挂后侧（staging，不进 schema，缓存零污染）。测试: dev_stage_call ${args.name} {"...":...}；转正: dev_stage_promote ${args.name}`
+    },
+  }))
+
+  safeRegister(defineTool({
+    name: 'dev_stage_call',
+    description: '调用后侧（staging）工具测试：不进 schema、不污染缓存。args 为传给工具的 JSON 参数对象。',
+    parameters: {
+      name: { type: 'string', required: true, description: 'staging 工具名' },
+      args: { type: 'json', description: '传给工具的 JSON 参数（可选）' },
+    },
+    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
+    async execute(a: any) {
+      const t = staged.get(a.name)
+      if (!t) return `ERROR: staging 无此工具（${a.name}）——dev_stage_list 查看`
+      try {
+        return String(await t.execute(a.args ?? {}, ctx))
+      } catch (e) {
+        return 'ERROR: ' + (e instanceof Error ? (e.stack ?? e.message) : String(e))
+      }
+    },
+  }))
+
+  safeRegister(defineTool({
+    name: 'dev_stage_list',
+    description: '列出后侧（staging）工具（含转正状态）',
+    parameters: {},
+    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
+    async execute() {
+      if (staged.size === 0) return '（staging 空）'
+      const lines = [...staged.entries()].map(([name, t]) => `- ${name} ${t.promoted ? '[已转正]' : '[后侧]'} : ${t.description.slice(0, 60)}`)
+      return lines.join('\n')
+    },
+  }))
+
+  safeRegister(defineTool({
+    name: 'dev_stage_promote',
+    description: '转正：把 staging 工具一键挂"前侧"（正式注册进 tools schema，下一次请求缓存刷新一次）。确认工具有效后使用。',
+    parameters: { name: { type: 'string', required: true, description: 'staging 工具名' } },
+    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
+    async execute(a: any) {
+      const t = staged.get(a.name)
+      if (!t) return `ERROR: staging 无此工具（${a.name}）`
+      if (t.promoted) return `${a.name} 已在前侧（转正过）`
+      try {
+        ctx.tools.register(defineTool({
+          name: a.name,
+          description: t.description,
+          parameters: t.parameters as never,
+          output: { schema: { type: 'string' }, render: (_x: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
+          async execute(args: Record<string, unknown>) {
+            return String(await t.execute(args, ctx))
+          },
+        }))
+      } catch (e) {
+        return 'ERROR: 转正注册失败: ' + String(e)
+      }
+      t.promoted = true
+      return `OK: ${a.name} 已转正挂前侧（进 schema）。注意：下一次请求将刷新缓存（唯一一次全灭）。`
+    },
+  }))
+
+  safeRegister(defineTool({
+    name: 'dev_stage_demote',
+    description: '丢弃/撤回：从 staging 移除工具（若已转正则同时从正式工具集注销）。',
+    parameters: { name: { type: 'string', required: true, description: 'staging 工具名' } },
+    output: { schema: { type: 'string' }, render: (_a: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
+    async execute(a: any) {
+      const t = staged.get(a.name)
+      if (!t) return `ERROR: staging 无此工具（${a.name}）`
+      staged.delete(a.name)
+      return `OK: ${a.name} 已从 staging 移除`
+    },
+  }))
+
   function stateOf(entry: any): string {
     return entry.fiber ? (FIBER_NAMES[entry.fiber.state] ?? `state:${entry.fiber.state}`) : 'no-fiber'
   }
