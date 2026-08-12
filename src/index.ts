@@ -26,7 +26,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from 'schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync } from 'node:fs'
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -482,6 +482,24 @@ export function apply(ctx: AppContext, config: Config): void {
       }
     }
     if (!steps.some(s => s.startsWith('entry 已卸载'))) steps.push('（无匹配 entry）')
+    // 1.5 阻断 bundle patch 自装配：插件自带 cordis.patch.yml 会 insert 自己，
+    // include.refresh 会把刚卸的 entry 加回（卸载不全的根因）。在 profile patch
+    // 写 disabled 覆盖（loader patch 同 id 的 disabled 优先于 bundle 层 insert）。
+    if (fullName) {
+      try {
+        const patchFile = join(profileNodeModules, '..', 'cordis.patch.yml')
+        if (existsSync(patchFile)) {
+          const content = readFileSync(patchFile, 'utf8')
+          const idShort = fullName.split('/').pop()
+          if (idShort && !content.includes(`id: ${idShort}`)) {
+            appendFileSync(patchFile, `\n# 已卸载插件（${fullName}）：disabled 阻断其 bundle patch 自装配\n- id: ${idShort}\n  disabled: true\n`)
+            steps.push('profile patch 已写 disabled（阻断自装配，防 refresh 加回）')
+          }
+        }
+      } catch (e) {
+        steps.push('profile patch 写入失败: ' + String(e))
+      }
+    }
     // 2. registry 清理（按 name 或目录匹配）
     const reg = readRegistry()
     const hit = reg.find(e => e.name.includes(match) || e.dir.includes(match))
