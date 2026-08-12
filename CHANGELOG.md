@@ -23,6 +23,21 @@
 - 工具 schema 兜底 + `safeRegister` 冲突容忍（同名工具跳过注册而非崩溃）
 - 注入防重改权威判断（`hasActiveEntry`）+ 失败残留清理
 
+## [0.1.1] — 2026-08-13
+
+### 修复
+
+- `dev_stage_demote` 无法注销已转正工具：`dev_stage_promote` 注册改挂 `ctx.effect` 并保存 disposer，demote 时真正从正式工具集注销（此前只删 staging 条目，正式注册残留）
+- `purgeCache` 防御：loader.internal 缺失时安全跳过（不再非空断言炸 inject 路径）
+- registry 原子写（tmp + rename）：中断不残留半截 JSON 毒化自动恢复
+
+### 优化
+
+- `dev_inject_plugin` dir 参数必填 + 空值兜底报错
+- `hasActiveEntry` fiber 状态魔数（2）改为语义常量（FIBER_NAMES 反查 'active'）
+- 预防正式版：peerDeps 放宽（`@deepseek-ai/dsh-tools >=0.0.1-rc <2`、`cordis >=4.0.0-rc <5`）
+- 文档：README 新增「生态定位：官方之下的运行时标准层」章节
+
 ## 未发布
 
 - 见 [README.md](./README.md) 与仓库提交历史
