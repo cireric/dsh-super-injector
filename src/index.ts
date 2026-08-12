@@ -96,25 +96,6 @@ function fingerprintOf(dir: string): string | null {
   }
 }
 
-/** 从 llm/stream 请求里提取最后一条 user 消息文本（前 300 字符），供关键词判断。 */
-function extractQueryText(options: unknown): string {
-  const messages = (options as { messages?: Array<{ role?: string; content?: unknown }> }).messages
-  if (!messages || messages.length === 0) return ''
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    const m = messages[i]
-    if (m?.role !== 'user') continue
-    const content = m.content
-    if (typeof content === 'string') return content.slice(0, 300)
-    if (Array.isArray(content)) {
-      const text = content
-        .map((b) => (typeof b === 'object' && b !== null && 'text' in b ? String((b as { text: unknown }).text) : ''))
-        .join(' ')
-      if (text.trim() !== '') return text.slice(0, 300)
-    }
-  }
-  return ''
-}
-
 export function apply(ctx: AppContext, config: Config): void {
   const logger = ctx.logger
   const registryFile = config.registryFile || join(homedir(), '.dsh', 'super-injector', 'registry.json')
@@ -530,45 +511,13 @@ export function apply(ctx: AppContext, config: Config): void {
     },
   }))
 
-  // ============ 智能能力提示注入 ============
-  // 新会话首轮注入完整版（开箱认知，仅一次）；关键词命中注入一行简版；其余零注入。
-  const KEYWORDS = ['热重载', '重载', '热更新', '重新加载', '插件', '构建', '编译', 'build', 'dev_reload', 'hmr', 'reload', '注入', 'inject']
-  const sessions = new Map<string, { turns: number; hit: boolean; injected: boolean }>()
-  let lastSessionId: string | null = null
-
-  ctx.on('llm/stream', (options, next) => {
-    const sessionId = (options as { sessionId?: string }).sessionId
-    if (sessionId) {
-      lastSessionId = sessionId
-      const st = sessions.get(sessionId) ?? { turns: 0, hit: false, injected: false }
-      st.turns += 1
-      const query = extractQueryText(options).toLowerCase()
-      st.hit = KEYWORDS.some(k => query.includes(k))
-      sessions.set(sessionId, st)
-    }
-    return next()
-  })
-
+  // ============ 能力提示注入（缓存友好：固定内容 + 最尾 order）============
+  // 参考官方 system prompt 设计：静态模板稳定、动态内容尾部化。本段每轮渲染
+  // 完全相同（常量 text），order 9998 排在一切之后——不破坏 LLM 前缀缓存。
   ctx.systemPrompt.context({
     name: 'dsh-super-injector',
-    order: 850,
-    text: () => {
-      const st = lastSessionId ? sessions.get(lastSessionId) : undefined
-      const dirs = watches.map(w => w.match).join('、') || '（未配置）'
-      if (!st || st.turns === 1) {
-        if (st) st.injected = true
-        return [
-          '本环境已安装 dsh-super-injector：超级模组注入 + 热重载引擎。',
-          '- 运行时注入任意本地插件包：dev_inject_plugin（目录路径）→ 下一 step 工具即可见，免 patch/免重启；',
-          '- 已注入清单重启自动恢复：dev_injected_list；',
-          '- 改已 watch 插件（' + dirs + '）源码后执行构建，约 1.5 秒自动整包热重载生效（失败回滚保留旧代）：dev_reload_package 可手动触发；',
-          '- 双路径持久化装配：dev_install_package（改 profile package.json，重启后由 bundles 接管）；',
-          '- cordis.patch.yml 的 config/插件行变更同样即时热更新（官方 watchUserPatches → include.refresh）。',
-        ].join('\n')
-      }
-      if (st.hit) return '本环境支持插件注入与热重载：dev_inject_plugin 注入、dev_reload_package 重载、build 后 ~1.5s 自动生效（细节见工具描述）。'
-      return ''
-    },
+    order: 9998,
+    text: '本环境支持插件注入与热重载：dev_inject_plugin 运行时注入、dev_reload_package 整包重载、改代码 build 后约 1.5 秒自动生效（细节见各工具描述）。',
   })
 
   logger.info('[super-injector] 就绪：watch %d 目录（%dms），autoRestore=%s', watches.length, intervalMs, String(config.autoRestore))
