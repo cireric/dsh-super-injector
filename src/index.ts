@@ -26,7 +26,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from 'schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync } from 'node:fs'
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -118,7 +118,10 @@ export function apply(ctx: AppContext, config: Config): void {
 
   function writeRegistry(list: RegistryEntry[]): void {
     mkdirSync(dirname(registryFile), { recursive: true })
-    writeFileSync(registryFile, JSON.stringify(list, null, 2), 'utf8')
+    // 原子写：先 tmp 再 rename，避免中途崩溃留下半截 JSON 毒化下次恢复。
+    const tmp = registryFile + '.tmp'
+    writeFileSync(tmp, JSON.stringify(list, null, 2), 'utf8')
+    renameSync(tmp, registryFile)
   }
 
   /** 该包是否已有 ACTIVE 的 loader entry（权威防重判断）。 */
@@ -126,15 +129,16 @@ export function apply(ctx: AppContext, config: Config): void {
     for (const entry of ctx.loader.entries()) {
       const opts = entry.options
       if (opts.group) continue
-      if (opts.name === pkgName && entry.fiber && entry.fiber.state === 2) return true
+      if (opts.name === pkgName && entry.fiber && FIBER_NAMES[entry.fiber.state] === 'active') return true
     }
     return false
   }
 
   /** 清除某包目录的模块缓存残留（失败 import 留下的残缺 job 会毒化重试）。 */
   function purgeCache(pkgDir: string): void {
+    const loadCache = ctx.loader.internal?.loadCache as Map<string, unknown> | undefined
+    if (!loadCache || typeof loadCache.delete !== 'function') return
     const key = pkgDir.replace(/\\/g, '/')
-    const loadCache = ctx.loader.internal!.loadCache as Map<string, unknown>
     for (const u of [...loadCache.keys()]) {
       if (typeof u === 'string' && u.includes(key)) Map.prototype.delete.call(loadCache, u)
     }
@@ -170,8 +174,49 @@ export function apply(ctx: AppContext, config: Config): void {
     if (!entryUrl) return `ERROR: 未找到入口 lib/index.js（匹配 ${urls.length} 个模块）`
 
     const oldJob = loadCache.get(entryUrl)
-    const oldPlugin = ctx.loader.unwrapExports(oldJob?.module?.getNamespace())
-    if (!oldPlugin) return 'ERROR: 无法从入口模块解出插件导出'
+    // 坏 job 兜底：旧模块可能卡在 "not instantiated"（此前失败中断的残留），
+    // getNamespace 会抛错把重载堵死——此时放弃回滚（坏状态无法回滚），直接
+    // purge 后 import 重建。回滚备份仅在旧插件可正常解出时才有意义。
+    let oldPlugin: any = null
+    let oldJobUsable = false
+    try {
+      oldPlugin = ctx.loader.unwrapExports(oldJob?.module?.getNamespace())
+      oldJobUsable = oldPlugin !== null && oldPlugin !== undefined
+    } catch {
+      oldJobUsable = false
+    }
+    if (!oldJobUsable) {
+      // 清缓存 + 直接重 import（无旧代可回滚，失败则保留旧缓存原样）
+      const backup = new Map<string, any>()
+      for (const u of urls) {
+        backup.set(u, loadCache.get(u))
+        Map.prototype.delete.call(loadCache, u)
+      }
+      try {
+        const fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrl, () => []))
+        for (const entry of ctx.loader.entries()) {
+          const opts = entry.options as { name?: string; id?: string }
+          if (opts?.name && String(opts.name).includes(match)) {
+            const fiber = entry.fiber
+            if (fiber && typeof fiber === 'object') {
+              // 尝试用新插件导出重建 fiber（entry 的 plugin 引用替换）
+              const registry = (ctx as any).registry
+              if (registry && typeof registry.delete === 'function' && typeof registry.plugin === 'function') {
+                registry.delete(fiber)
+                const nf = registry.plugin(fresh, entry.options.config ?? {}, () => [])
+                nf.entry = entry
+                entry.fiber = nf
+              }
+            }
+          }
+        }
+        return `OK: ${match} 坏缓存兜底重载完成（无旧代回滚）`
+      } catch (e) {
+        for (const [u, job] of backup) loadCache.set(u, job)
+        return 'ERROR: 兜底 import 失败，已恢复原缓存: ' + (e instanceof Error ? e.stack : String(e))
+      }
+    }
+
     const runtime = ctx.registry.get(oldPlugin)
     if (!runtime) return 'ERROR: registry 中无该插件 runtime'
 
@@ -296,6 +341,8 @@ export function apply(ctx: AppContext, config: Config): void {
     parameters: Record<string, unknown>
     execute: (args: Record<string, unknown>, c: any) => unknown | Promise<unknown>
     promoted: boolean
+    /** 转正注册的释放句柄（ctx.effect disposer）——demote 时注销正式工具。 */
+    disposer?: () => void
   }
   const staged = new Map<string, StagedTool>()
 
@@ -369,7 +416,8 @@ export function apply(ctx: AppContext, config: Config): void {
       if (!t) return `ERROR: staging 无此工具（${a.name}）`
       if (t.promoted) return `${a.name} 已在前侧（转正过）`
       try {
-        ctx.tools.register(defineTool({
+        // 注册挂 ctx.effect：拿 disposer，demote 时才能真正注销正式工具。
+        const dispose = ctx.effect(() => ctx.tools.register(defineTool({
           name: a.name,
           description: t.description,
           parameters: t.parameters as never,
@@ -377,7 +425,8 @@ export function apply(ctx: AppContext, config: Config): void {
           async execute(args: Record<string, unknown>) {
             return String(await t.execute(args, ctx))
           },
-        }))
+        })))
+        t.disposer = () => dispose()
       } catch (e) {
         return 'ERROR: 转正注册失败: ' + String(e)
       }
@@ -394,8 +443,17 @@ export function apply(ctx: AppContext, config: Config): void {
     async execute(a: any) {
       const t = staged.get(a.name)
       if (!t) return `ERROR: staging 无此工具（${a.name}）`
+      let unregistered = ''
+      if (t.disposer) {
+        try {
+          t.disposer()
+          unregistered = '，已从正式工具集注销'
+        } catch (e) {
+          unregistered = '，正式工具注销失败: ' + String(e)
+        }
+      }
       staged.delete(a.name)
-      return `OK: ${a.name} 已从 staging 移除`
+      return `OK: ${a.name} 已从 staging 移除${unregistered}`
     },
   }))
 
@@ -580,14 +638,16 @@ export function apply(ctx: AppContext, config: Config): void {
     name: 'dev_inject_plugin',
     description: '超级模组注入器：运行时注入任意本地 DSH 插件包（junction 链接 + loader.create，不碰 patch/package.json、不重启）。参数 = 插件包目录绝对路径（含 package.json 与 lib/）',
     parameters: {
-      dir: { type: 'string', description: '插件包目录绝对路径（如 F:/dsh/03-dev-infra/dsh-xxx）' },
+      dir: { type: 'string', required: true, description: '插件包目录绝对路径（如 F:/dsh/03-dev-infra/dsh-xxx）' },
     },
     output: {
       schema: { type: 'string' },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
     async execute(args: { dir: string }) {
-      return inject(args.dir)
+      const dir = String(args.dir ?? '').trim()
+      if (!dir) return 'ERROR: dir 必填（插件包目录绝对路径）'
+      return inject(dir)
     },
   }))
 
