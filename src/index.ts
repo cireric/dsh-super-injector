@@ -34,12 +34,13 @@ type AppContext = Context & {
   loader: Loader
   tools: ToolRegistry
   systemPrompt: SystemPrompt
+  httpServer: any
   registry: any
   setInterval(fn: () => void, ms: number): any
 }
 
 export const name = 'dsh-super-injector'
-export const inject = ['loader', 'timer', 'tools', 'systemPrompt']
+export const inject = ['loader', 'timer', 'tools', 'systemPrompt', 'httpServer']
 
 export interface Config {
   /** 注入清单文件路径（缺省 ~/.dsh/super-injector/registry.json）。 */
@@ -459,6 +460,36 @@ export function apply(ctx: AppContext, config: Config): void {
     },
     async execute(args: { match: string }) {
       return uninject(args.match)
+    },
+  }))
+
+  safeRegister(defineTool({
+    name: 'dev_clear_routes',
+    description: '清 webserver 路由表残留：删除 path 前缀匹配的 exact/prefixes/upgrades 条目（插件热重载残留路由的自愈工具，无需重启）',
+    parameters: {
+      prefix: { type: 'string', description: 'path 前缀（如 /browser-panel）' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
+    },
+    async execute(args: { prefix: string }) {
+      const hs = ctx.httpServer
+      const out: string[] = []
+      for (const tableName of ['exact', 'prefixes', 'upgrades'] as const) {
+        const table = hs?.[tableName]
+        if (!table || typeof table.delete !== 'function') {
+          out.push(`${tableName}: 不可访问`)
+          continue
+        }
+        const keys = [...table.keys()].filter((k: unknown) => String(k).startsWith(args.prefix))
+        for (const k of keys) {
+          table.delete(k)
+          out.push(`deleted ${tableName}[${k}]`)
+        }
+        if (!keys.length) out.push(`${tableName}: 无匹配`)
+      }
+      return out.join('\n')
     },
   }))
 
