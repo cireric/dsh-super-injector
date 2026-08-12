@@ -184,6 +184,44 @@ export function apply(ctx: AppContext, config: Config): void {
     const entryUrl = urls.find(u => u.endsWith('/lib/index.js'))
     if (!entryUrl) return `ERROR: 未找到入口 lib/index.js（匹配 ${urls.length} 个模块）`
 
+    // ═══ 重启器（自重载专用）：自杀后脱离自身 fiber 完成重建 ═══
+    // 自重载时 dispose 会把当前 fiber（含本工具）销毁，随后的重建代码
+    // 跑在已销毁的上下文里必然失败。解决：先 dispose + purge（释放文件
+    // 句柄，不锁定 lib 文件），再用**全局 setTimeout**（不属于任何 fiber
+    // 的 disposables，dispose 不会清它）延迟重建——自杀后生命周期由全局
+    // 定时器延续，直到重建结束。
+    const isSelf = String(match).includes('dsh-super-injector')
+    if (isSelf) {
+      const selfEntry = [...ctx.loader.entries()].find((en) => {
+        const o = en.options as { name?: string }
+        return o?.name && String(o.name).includes(match)
+      })
+      try {
+        if (selfEntry?.fiber && typeof selfEntry.fiber.dispose === 'function') {
+          await selfEntry.fiber.dispose()
+        }
+        for (const u of urls) Map.prototype.delete.call(loadCache, u)
+      } catch { /* 清理失败不阻塞 */ }
+      // 全局定时器（globalThis.setTimeout，非 fiber 的 ctx.setTimeout）
+      const planned = globalThis.setTimeout(() => {
+        void (async () => {
+          try {
+            const fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrl, () => []))
+            if (selfEntry) {
+              const nf = ctx.registry.plugin(fresh, selfEntry.options.config ?? {}, () => [])
+              nf.entry = selfEntry
+              selfEntry.fiber = nf
+              logger.info('[super-injector] 重启器重建完成 state=%s', nf.state)
+            }
+          } catch (error) {
+            logger.error('[super-injector] 重启器重建失败: %s', String(error))
+          }
+        })()
+      }, 100)
+      void planned
+      return `OK: 注入器已自杀（dispose + 释放文件句柄），重建已排程（100ms 后由全局定时器执行——重启器生命周期独立于自身 fiber）`
+    }
+
     const oldJob = loadCache.get(entryUrl)
     // 坏 job 兜底：旧模块可能卡在 "not instantiated"（此前失败中断的残留），
     // getNamespace 会抛错把重载堵死——此时放弃回滚（坏状态无法回滚），直接
