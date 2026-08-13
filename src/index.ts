@@ -904,21 +904,12 @@ export function apply(ctx: AppContext, config: Config): void {
         return `ERROR: 自重载预检失败——新代码无法加载（${String(e).slice(0, 200)}），已拒绝自杀（旧代码继续运行，缓存已恢复）`
       }
 
+      // ═══ v0.3 最终形态：工具只排程、绝不亲自自杀 ═══
+      // 实测（REPLACE 重构时）：工具在自身 fiber 上执行 dispose（自杀）会被
+      // cordis 取消执行（"inactive context"）——即使 rebuild 成功工具也抛错。
+      // 正解：自杀+重建全部移进 reboot（global setTimeout，独立于自身 fiber
+      // 生命周期——重启器本来的设计语义）。工具这里只：purge 缓存 + 排程。
       try {
-        if (selfEntry?.fiber && typeof selfEntry.fiber.dispose === 'function') {
-          // ⚠️ 根修（实测）：loader 的 internal/plugin 监听（emitPluginDisposed
-          // 在 dispose 时也会 emit，旧 fiber uid 已置 null）会把「自我 dispose
-          // 但 loader 未在卸载」的 fiber 标 entry disabled（case 7）。豁免通道
-          // 是 entry._disposing（case 6：loader 正在卸载）。自重载是裸
-          // fiber.dispose()（不经 entry._dispose），必须先设 _disposing 标志，
-          // 否则官方 entry 被标 disabled（官方清单 enabled=false 的根因）。
-          selfEntry._disposing = 1
-          try {
-            await selfEntry.fiber.dispose()
-          } finally {
-            selfEntry._disposing = 0
-          }
-        }
         for (const u of urls) Map.prototype.delete.call(loadCache, u)
       } catch { /* 清理失败不阻塞 */ }
       // ═══ 稳定性增强②：看门狗 ═══
@@ -938,34 +929,59 @@ export function apply(ctx: AppContext, config: Config): void {
       const planned = globalThis.setTimeout(() => {
         void (async () => {
           try {
-            // ⚠️ 服务访问必须走 loader 树根 ctx（rebootCtx = ctx.root，恒活跃）：
-            // 注入器已自杀后 selfEntry.ctx 会 inactive——用它调 ctx.loader.import()
-            // 会抛「cannot get required service "loader" in inactive context」
-            // （实测：cloud-restore 版自重载自杀后 rebuild 失败的根因）。ctx.root
-            // 原型链继承 loader 的活跃 fiber，服务解析正常。
+            // ═══ v0.3 重构：官方 REPLACE 语义（SPEC §1.1/4.3，实测校准）═══
+            // 与 entry.update 的 REPLACE 分支同构（entry.ts L214-246）：
+            //   import 新模块（经 entry.parent.tree——与 include 装配同路径）
+            //   → entry._dispose()（官方：_disposing 豁免 + entry.fiber 清空）
+            //   → fiber 创建（registry.plugin）+ 手动关联 entry
+            //   → 失败 rollback（官方语义）
+            // ⚠️ 实测校准（entry.ctx 不可用）：reboot 上下文（global setTimeout，
+            // 无活跃 fiber）里 entry.ctx 的服务解析抛 inactive（它关联注入器
+            // fiber 链，自杀后失效）——fiber 创建必须走 rebootCtx（ctx.root，
+            // 原型链到 loader 活跃 fiber）。代价：fiber.parent 无 Entry.key →
+            // loader 监听不自动设 fiber.entry → 手动关联（nf.entry + entry.fiber）
+            // 是 reboot 上下文的必要适配，且需 _disposing 豁免（entry._dispose
+            // 官方计数）与 disabled 兜底清理。
+            const entry = selfEntry as any
+            if (!entry || typeof entry._dispose !== 'function') {
+              throw new Error('selfEntry 无官方 _dispose（loader 契约缺失）')
+            }
             const rebootCtx = ctx.root as any
-            const fresh = rebootCtx.loader.unwrapExports(await rebootCtx.loader.import(entryUrlFinal, () => []))
-            if (selfEntry) {
-              // registry.plugin() 断言当前 fiber 存活：rebootCtx.fiber 指向
-              // loader 的活跃 fiber，assertActive 通过。
-              const nf = rebootCtx.registry.plugin(fresh, selfEntry.options.config ?? {}, () => [])
-              nf.entry = selfEntry
-              selfEntry.fiber = nf
-              // ⚠️ 清 disabled（实测）：rebuild 的新 fiber 触发 loader 的
-              // internal/plugin 监听 case 7，把 entry.options.disabled 标 true
-              // （官方清单显示 disabled 的根因；普通重载路径有 normalize 兜底，
-              // 唯独自重载路径漏了）。立即清除，保证官方清单 enabled=true。
+            const previousPlugin = entry.fiber?.runtime?.callback ?? null
+            const fresh = rebootCtx.loader.unwrapExports(
+              await entry.parent.tree.import(entry.options.name, () => []),
+            )
+            await entry._dispose()
+            const startWith = async (plugin: any): Promise<void> => {
+              const fiber = rebootCtx.registry.plugin(plugin, entry.options.config ?? {}, entry.getOuterStack)
+              fiber.entry = entry
+              entry.fiber = fiber
+              await fiber.await()
+              // 兜底：清 disabled（新 fiber 可能触发 loader case 7 标记）
               try {
-                if (selfEntry.options.disabled !== undefined) delete selfEntry.options.disabled
-                const parent = selfEntry.parent
+                if (entry.options.disabled !== undefined) delete entry.options.disabled
+                const parent = entry.parent
                 if (parent && Array.isArray(parent.data)) {
                   for (const d of parent.data) {
-                    if (d && d.id === selfEntry.id && d.disabled !== undefined) delete d.disabled
+                    if (d && d.id === entry.id && d.disabled !== undefined) delete d.disabled
                   }
                 }
               } catch { /* 清理失败不阻塞 */ }
-              logger.info('[super-injector] 重启器重建完成 state=%s', nf.state)
             }
+            try {
+              await startWith(fresh)
+            } catch (error) {
+              // 官方 rollback：旧插件重新装配
+              if (previousPlugin) {
+                try {
+                  await startWith(previousPlugin)
+                } catch (rollbackError) {
+                  throw new AggregateError([error, rollbackError], 'reboot 与 rollback 均失败')
+                }
+              }
+              throw error
+            }
+            logger.info('[super-injector] 重启器重建完成（REPLACE 语义，fiber=%s）', entry.fiber?.state)
           } catch (error) {
             logger.error('[super-injector] 重启器重建失败: %s', String(error))
             console.error('[super-injector] 重启器重建失败:', error)
