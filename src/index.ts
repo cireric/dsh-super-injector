@@ -287,6 +287,43 @@ export function apply(ctx: AppContext, config: Config): void {
           } catch (error) {
             logger.error('[super-injector] 重启器重建失败: %s', String(error))
             console.error('[super-injector] 重启器重建失败:', error)
+            // ═══ 失败自愈（实测保障）：垃圾缓存/文件损坏/异步堵塞导致重建失败时，
+            // 注入器已缺席——自动重试装配（3 次，间隔 4s/8s/12s）：每次先 purge
+            // 毒化缓存（loadCache 残缺 job 会让 loader.create 复用失败态），再
+            // 用 rebootCtx.loader.create 新建 entry 重新装配（绕过坏缓存/坏
+            // fiber，走 loader 标准路径）。实测：单次 3s 窗口太紧（文件恢复
+            // 动作跨工具往返就超窗），重试给足修复窗口。
+            try {
+              const rebootCtx = (selfEntry?.ctx ?? ctx.root) as any
+              const pkgName = selfEntry?.options?.name ?? '@dsh-external/dsh-super-injector'
+              const cfg = selfEntry?.options?.config ?? {}
+              let attempt = 0
+              const heal = (): void => {
+                attempt += 1
+                void (async () => {
+                  try {
+                    const lc = rebootCtx.loader.internal?.loadCache as Map<string, unknown> | undefined
+                    if (lc && typeof lc.delete === 'function') {
+                      for (const u of [...lc.keys()]) {
+                        if (typeof u === 'string' && decodeURIComponent(u).includes(pkgName)) {
+                          Map.prototype.delete.call(lc, u)
+                        }
+                      }
+                    }
+                    await rebootCtx.loader.create({ name: pkgName, config: cfg })
+                    logger.info('[super-injector] 自愈：第 %d 次 loader.create 重新装配完成（%s）', attempt, pkgName)
+                  } catch (e) {
+                    logger.error('[super-injector] 自愈第 %d 次失败: %s', attempt, String(e))
+                    if (attempt < 3) globalThis.setTimeout(heal, 4000)
+                    else logger.error('[super-injector] 自愈 3 次均失败（需人工介入：修复产物后 touch profile patch 触发重装配）')
+                  }
+                })()
+              }
+              globalThis.setTimeout(heal, 4000)
+              logger.warn('[super-injector] 自愈已排程（4s 后第 1 次 loader.create，最多 3 次）')
+            } catch (e) {
+              logger.error('[super-injector] 自愈排程失败: %s', String(e))
+            }
           } finally {
             // 防自毁③：无论成败都释放窗口锁（失败时注入器已缺席，锁必须
             // 释放以便后续手动/自动恢复路径可重新装配）
