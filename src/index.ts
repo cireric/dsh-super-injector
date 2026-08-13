@@ -1176,13 +1176,16 @@ export function apply(ctx: AppContext, config: Config): void {
   /** 当前 loader 已装配插件清单（确定性信息：id/name/fiber 状态/入口）。 */
   function listPlugins(): string {
     const lines: string[] = []
+    const injectedNames = new Set(readRegistry().map((e) => e.name))
     for (const entry of ctx.loader.entries()) {
       const opts = entry.options
       if (opts.group) continue
       const state = entry.fiber ? (FIBER_NAMES[entry.fiber.state] ?? `state:${entry.fiber.state}`) : 'no-fiber'
       const entryUrl = [...ctx.loader.internal!.loadCache.keys()]
         .find(u => typeof u === 'string' && u.includes(opts.id))
-      lines.push(`- [${state}] ${opts.id} (${opts.name})${opts.disabled ? ' [disabled]' : ''}${entryUrl ? '\n    entry: ' + entryUrl : ''}`)
+      // 注入插件标记 [injected]（与 bundle 装配区分，避免 hash id 难认）
+      const injected = injectedNames.has(opts.name) ? ' [injected]' : ''
+      lines.push(`- [${state}] ${opts.id} (${opts.name})${injected}${opts.disabled ? ' [disabled]' : ''}${entryUrl ? '\n    entry: ' + entryUrl : ''}`)
     }
     return lines.length ? lines.join('\n') : '（loader 中无已装配插件 entry）'
   }
@@ -2002,7 +2005,7 @@ export function apply(ctx: AppContext, config: Config): void {
 
   safeRegister(defineTool({
     name: 'dev_uninject_plugin',
-    description: '超级模组卸载器：卸载已注入的插件包——卸 loader entry（fiber dispose，工具/监听全清理）→ 清注入清单 → 删 profile junction，免重启。参数 = 包名子串（如 dsh-toy-supermod）',
+    description: '超级模组卸载器：卸载已注入的插件包——卸 loader entry（fiber dispose，工具/监听全清理）→ 清注入清单 → 删 profile junction → 另写 profile patch disabled 条目（防 include.refresh 加回），免重启。参数 = 包名子串（如 dsh-toy-supermod）',
     parameters: {
       match: { type: 'string', description: '包名/路径子串（如 dsh-toy-supermod 或 @dsh-external/dsh-toy-supermod）' },
     },
@@ -2460,18 +2463,22 @@ export function apply(ctx: AppContext, config: Config): void {
           diag += 'tmpLib=' + existsSync(join(tmpDir, 'lib', 'index.js')) + ' tmpPkg=' + existsSync(join(tmpDir, 'package.json')) + ' tmpSrc=' + existsSync(join(tmpDir, 'src', 'index.ts'))
           check('注入（host ✓）', false, inj + '\n' + diag)
         }
-        // ── 4. 热重载 → fiber uid 变化（用环境常驻插件 engram 验证机制；
-        //    自检临时插件的 create 缓存行为与运行时注入有差异，避免假阴性）──
-        const refEntry = [...ctx.loader.entries()].find((e) => !e.options.group && String(e.options.name).includes('dsh-engram-relay') && e.fiber)
-        if (refEntry?.fiber) {
-          const beforeUid = refEntry.fiber.uid
-          const rl = await withOpLock(() => reloadPackage('dsh-engram-relay'))
-          const afterEntry = [...ctx.loader.entries()].find((e) => !e.options.group && String(e.options.name).includes('dsh-engram-relay') && e.fiber)
-          const afterUid = afterEntry?.fiber ? afterEntry.fiber.uid : null
-          check('热重载（uid 变化）', beforeUid !== null && afterUid !== null && beforeUid !== afterUid, `uid ${beforeUid} → ${afterUid} | ${rl.slice(0, 80)}`)
-        } else {
-          check('热重载（uid 变化）', true, 'SKIP：环境无 engram 参考插件')
-        }
+        // ── 4. 热重载 → fiber uid 变化（自包含：重载 selftest-runner 自身。
+        //    固定 specifier + 固定目录 → 缓存一致；不再依赖 engram 等外部插件）──
+        const beforeUid = (() => { for (const e of ctx.loader.entries()) { const o = e.options; if (!o.group && String(o.name) === TEST_PKG && e.fiber) return e.fiber.uid } return null })()
+        try {
+          // 确保模块在缓存（purge 旧 key + 重新 import——固定目录解析一致）
+          const lcT = ctx.loader.internal?.loadCache as Map<string, unknown> | undefined
+          if (lcT) {
+            for (const u of [...lcT.keys()]) {
+              if (typeof u === 'string' && decodeURIComponent(u).includes(TEST_SHORT)) Map.prototype.delete.call(lcT, u)
+            }
+          }
+          await ctx.loader.import(TEST_PKG, () => [])
+        } catch { /* import 失败不阻塞（注入已加载） */ }
+        const rl = await withOpLock(() => reloadPackage(TEST_SHORT, tmpDir))
+        const afterUid = (() => { for (const e of ctx.loader.entries()) { const o = e.options; if (!o.group && String(o.name) === TEST_PKG && e.fiber) return e.fiber.uid } return null })()
+        check('热重载（uid 变化）', beforeUid !== null && afterUid !== null && beforeUid !== afterUid, `uid ${beforeUid} → ${afterUid} | ${rl.slice(0, 80)}`)
         // ── 5. 自重载节流（不真自杀：伪造时间戳）──
         writeSelfReloadState(Date.now() - 5000)
         const throttle = await withOpLock(() => reloadPackage('dsh-super-injector'))
