@@ -2,6 +2,17 @@
 
 本项目版本与仓库提交对应，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.2.4] — 2026-08-13
+
+### 修复
+
+- **发布包可独立安装（实测验证）**：tgz 增加 `scripts/build.sh`（此前 `files: ['lib']` 未带构建脚本）——解压副本此前缺 node_modules 依赖链接，`dsh plugin add` 后 `ERR_MODULE_NOT_FOUND` 装不上。现在解压后 `DSH_CHECKOUT=<checkout> bash scripts/build.sh` 即可建依赖链接。**实测**：下载 v0.2.4 tgz → 解压 → 建依赖 → 重启 → 注入器从云端副本加载并工作（自举验证通过）
+- **自重载降级匹配用 realpath**：缓存无匹配降级从磁盘加载后，按包名重新匹配会失败（副本目录如 `cloud-restore` 不含包名）——改 `realpathSync(lib)` 匹配 loadCache 真实 key（实测：云端副本自重载链路修复）
+
+### 质量
+
+- 云源自举实验：卸载本地注入器 → 下载 GitHub release 副本 → 装配 → 运行中注入器 = 云端版（entry URL 指向副本），工具/自检全部可用
+
 ## [0.1.0] — 2026-08-12
 
 ### 新增

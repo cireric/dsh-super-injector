@@ -27,7 +27,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from 'schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -795,8 +795,12 @@ export function apply(ctx: AppContext, config: Config): void {
     // 自重载/热重载直接失效（实测多次 + 测评复现）。降级：从磁盘 URL 直接
     // import（junction 路径 / urlMatch 目录的 lib/index.js），loader.import
     // 会重新解析磁盘文件并填充缓存——重载流程继续，链路自愈。
+    // ⚠️ 匹配必须用 realpath（实测踩坑）：副本目录（如 cloud-restore）不含
+    // 包名——按 urlKey（包名）重新匹配会失败。realpathSync(lib) 与 loadCache
+    // 的真实 key（realpath URL）一致。
+    let entryUrl: string | undefined
     if (urls.length === 0) {
-      let loaded = false
+      let libPath: string | undefined
       try {
         const entry = findEntry(match)
         const name = entry?.options?.name
@@ -807,24 +811,24 @@ export function apply(ctx: AppContext, config: Config): void {
         }
         if (urlMatch) candidates.push(join(urlMatch, 'lib', 'index.js'))
         for (const lib of candidates) {
-          if (existsSync(lib)) {
-            await ctx.loader.import(pathToFileURL(lib).href, () => [])
-            loaded = true
-            break
+          if (existsSync(lib)) { libPath = lib; break }
+        }
+        if (libPath) {
+          await ctx.loader.import(pathToFileURL(libPath).href, () => [])
+          const real = realpathSync(libPath).replace(/\\/g, '/')
+          for (const u of loadCache.keys()) {
+            if (typeof u === 'string' && decodeURIComponent(u).includes(real)) { entryUrl = u; break }
           }
         }
       } catch { /* 降级失败继续走下面判断 */ }
-      if (loaded) {
-        urls = [...loadCache.keys()].filter((u) => {
-          if (typeof u !== 'string') return false
-          return decodeURIComponent(u).includes(urlKey)
-        })
-        auditLog('cache-miss-healed', `缓存无匹配已降级从磁盘加载（${urlKey}）`)
+      if (entryUrl) {
+        auditLog('cache-miss-healed', `缓存无匹配已降级从磁盘加载（${urlKey} → ${entryUrl}）`)
       }
+    } else {
+      entryUrl = urls.find(u => u.endsWith('/lib/index.js'))
     }
-    if (!urls.length) return `INFO: 缓存中无匹配且磁盘降级失败 "${urlKey}" 的模块`
-    const entryUrl = urls.find(u => u.endsWith('/lib/index.js'))
-    if (!entryUrl) return `ERROR: 未找到入口 lib/index.js（匹配 ${urls.length} 个模块）`
+    if (!entryUrl) return `INFO: 缓存中无匹配且磁盘降级失败 "${urlKey}" 的模块`
+    const entryUrlFinal = entryUrl
 
     // ═══ 重启器（自重载专用）：自杀后脱离自身 fiber 完成重建 ═══
     // 自重载时 dispose 会把当前 fiber（含本工具）销毁，随后的重建代码
@@ -874,7 +878,7 @@ export function apply(ctx: AppContext, config: Config): void {
         }
       }
       try {
-        const probeNs = await ctx.loader.import(entryUrl, () => [])
+        const probeNs = await ctx.loader.import(entryUrlFinal, () => [])
         const probe = ctx.loader.unwrapExports(probeNs)
         const valid = probe && (typeof probe === 'function' || typeof probe.apply === 'function')
         if (!valid) {
@@ -929,7 +933,7 @@ export function apply(ctx: AppContext, config: Config): void {
             // （实测两次自重载失败的根因）。rebootCtx 原型链继承 loader
             // 的活跃 fiber，服务解析正常，与 loader._start 装配路径一致。
             const rebootCtx = (selfEntry?.ctx ?? ctx.root) as any
-            const fresh = rebootCtx.loader.unwrapExports(await rebootCtx.loader.import(entryUrl, () => []))
+            const fresh = rebootCtx.loader.unwrapExports(await rebootCtx.loader.import(entryUrlFinal, () => []))
             if (selfEntry) {
               // registry.plugin() 断言当前 fiber 存活：rebootCtx.fiber 指向
               // loader 的活跃 fiber，assertActive 通过。
@@ -980,7 +984,7 @@ export function apply(ctx: AppContext, config: Config): void {
       }
     }
 
-    const oldJob = loadCache.get(entryUrl)
+    const oldJob = loadCache.get(entryUrlFinal)
     // 坏 job 兜底：旧模块可能卡在 "not instantiated"（此前失败中断的残留），
     // getNamespace 会抛错把重载堵死——此时放弃回滚（坏状态无法回滚），直接
     // purge 后 import 重建。回滚备份仅在旧插件可正常解出时才有意义。
@@ -1000,7 +1004,7 @@ export function apply(ctx: AppContext, config: Config): void {
         Map.prototype.delete.call(loadCache, u)
       }
       try {
-        const fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrl, () => []))
+        const fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
         for (const entry of ctx.loader.entries()) {
           const opts = entry.options as { name?: string; id?: string }
           if (opts?.name && String(opts.name).includes(match)) {
@@ -1044,7 +1048,7 @@ export function apply(ctx: AppContext, config: Config): void {
             backup2.set(u, loadCache.get(u))
             Map.prototype.delete.call(loadCache, u)
           }
-          const fresh2 = ctx.loader.unwrapExports(await ctx.loader.import(entryUrl, () => []))
+          const fresh2 = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
           const nf2 = ctx.registry.plugin(fresh2, target.options.config ?? {}, () => [])
           nf2.entry = target
           target.fiber = nf2
@@ -1067,7 +1071,7 @@ export function apply(ctx: AppContext, config: Config): void {
     // 重新 import（失败 → 恢复缓存，旧代保留）
     let fresh: any
     try {
-      fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrl, () => []))
+      fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrlFinal, () => []))
     } catch (e) {
       for (const [u, job] of backup) loadCache.set(u, job)
       return 'ERROR: import 失败，已回滚缓存（旧代保留）: ' + (e instanceof Error ? e.stack : String(e))
