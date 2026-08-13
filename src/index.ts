@@ -358,19 +358,37 @@ export function apply(ctx: AppContext, config: Config): void {
       // 模块**（不重读磁盘）——缓存里的好代码会让预检形同虚设（实测踩坑：
       // 破坏文件后预检通过、reboot 重读才失败）。purge 后 import 读到磁盘
       // 新文件，预检才真实。
-      for (const u of urls) Map.prototype.delete.call(loadCache, u)
+      // ⚠️ 预检失败（拒绝自杀）时必须**恢复缓存**：purge 后旧模块 job 已丢，
+      // 注入器虽继续运行（fiber 在内存）但 loadCache 空 → 下次自重载报
+      // 「缓存中无匹配」无法执行（实测踩坑）。
+      // ⚠️ loadCache 是 Node 内部特殊 Map：写入必须 Map.prototype.set.call
+      // （直接 .set() 触发内部参数校验，对 ModuleJob 抛 "type must be string"，
+      // 实测踩坑）。
+      const precheckBackup = new Map<string, unknown>()
+      for (const u of urls) {
+        precheckBackup.set(u, loadCache.get(u))
+        Map.prototype.delete.call(loadCache, u)
+      }
+      const restorePrecheckCache = (): void => {
+        for (const [u, job] of precheckBackup) {
+          if (job === undefined) Map.prototype.delete.call(loadCache, u)
+          else Map.prototype.set.call(loadCache, u, job)
+        }
+      }
       try {
         const probeNs = await ctx.loader.import(entryUrl, () => [])
         const probe = ctx.loader.unwrapExports(probeNs)
         const valid = probe && (typeof probe === 'function' || typeof probe.apply === 'function')
         if (!valid) {
+          restorePrecheckCache()
           selfReloading = false
           return 'ERROR: 自重载预检失败——新代码导出非有效插件（缺 apply），已拒绝自杀（旧代码继续运行）'
         }
       } catch (e) {
+        restorePrecheckCache()
         selfReloading = false
         auditLog('precheck-failed', String(e))
-        return `ERROR: 自重载预检失败——新代码无法加载（${String(e).slice(0, 200)}），已拒绝自杀（旧代码继续运行）`
+        return `ERROR: 自重载预检失败——新代码无法加载（${String(e).slice(0, 200)}），已拒绝自杀（旧代码继续运行，缓存已恢复）`
       }
 
       try {
@@ -1332,15 +1350,46 @@ export function apply(ctx: AppContext, config: Config): void {
   }, intervalMs)
 
   // ============ 工具 ============
-  // 冲突容忍：bundle-hmr 未卸载的过渡期（或任何同名工具已注册）时跳过重复注册，
-  // 避免 "already registered" 炸掉整个 apply；重启后由本插件独占全量工具。
+  // ⚠️ 必须挂 ctx.effect（自己的踩坑记录自己遵守）：裸注册在 fiber 卸载
+  // （自重载 dispose/卸载）时不注销 → 残留工具闭包捕获旧 fiber 状态
+  // （selfReloading 等）→ 新实例注册撞 duplicate 被跳过 → 跑的是「僵尸
+  // 工具的僵尸闭包」（实测：锁永久卡死、新代码永不生效的根因）。
   function safeRegister(tool: any): void {
     try {
-      ctx.tools.register(tool)
+      ctx.effect(() => ctx.tools.register(tool), `dsh-super-injector: ${tool.name ?? 'tool'}`)
     } catch (e) {
       logger.warn('[super-injector] 跳过冲突工具注册: %s', e instanceof Error ? e.message : String(e))
     }
   }
+
+  /** 启动自净：清除历史版本裸注册残留的同名工具（僵尸闭包），再注册新工具。 */
+  function purgeStaleTools(): void {
+    try {
+      const toolsSvc = ctx.get('tools') as {
+        layers?: { global?: { tools?: Map<string, unknown> } }
+        unregister?: (name: string) => unknown
+      } | undefined
+      if (!toolsSvc) return
+      const names: string[] = []
+      const table = toolsSvc.layers?.global?.tools
+      if (table && typeof table.keys === 'function') {
+        for (const name of table.keys()) {
+          if (typeof name === 'string' && name.startsWith('dev_')) names.push(name)
+        }
+      }
+      for (const name of names) {
+        try {
+          if (typeof toolsSvc.unregister === 'function') toolsSvc.unregister(name)
+          else if (table) Map.prototype.delete.call(table, name)
+        } catch { /* 单项清理失败继续 */ }
+      }
+      if (names.length > 0) {
+        logger.warn('[super-injector] 已清理 %d 个僵尸工具残留: %s', names.length, names.join(','))
+        auditLog('purge-stale-tools', names.join(','))
+      }
+    } catch { /* 自净失败不阻塞 */ }
+  }
+  purgeStaleTools()
 
   safeRegister(defineTool({
     name: 'dev_inject_plugin',
@@ -1559,9 +1608,11 @@ export function apply(ctx: AppContext, config: Config): void {
     //    UI 面板 / 混合形态，同一通道——注入即完整生效（host+UI）、可热
     //    重载与自重载、卸载即净；
     // 3) 插件自身的提示词/工具/循环皆可自我优化（改→build→重载闭环）；
-    // 4) 使命：若注入器无法支撑此闭环，优先修复注入器。
+    // 4) 资源复用：建新插件优先克隆/借鉴/重构生态已有资源（dsh-external
+    //    仓库、已注入插件、官方 packages 的服务面与构建模式），不重复造轮子；
+    // 5) 使命：若注入器无法支撑此闭环，优先修复注入器。
     // ⚠️ 静态常量文本（缓存原则：静态到头）——严禁动态拼接。
-    text: '本环境装有 dsh-super-injector（dev_* 工具）：任意本地插件包可运行时注入——工具包/守护循环（timer+LLM 自主 agent loop）/UI 面板/混合形态，同一通道；注入即完整生效（host+UI）、可热重载与自重载、卸载即净。插件自身的提示词/工具/循环皆可自我优化。若注入器无法支撑此闭环，优先修复注入器。',
+    text: '本环境装有 dsh-super-injector（dev_* 工具）：任意本地插件包可运行时注入——工具包/守护循环（timer+LLM 自主 agent loop）/UI 面板/混合形态，同一通道；注入即完整生效（host+UI）、可热重载与自重载、卸载即净。插件自身的提示词/工具/循环皆可自我优化；建新插件优先克隆/借鉴/重构生态已有资源（dsh-external 仓库、已注入插件、官方 packages 模式），不重复造轮子。若注入器无法支撑此闭环，优先修复注入器。',
   })
 
   logger.info('[super-injector] 就绪：watch %d 目录（%dms），autoRestore=%s', watches.length, intervalMs, String(config.autoRestore))
