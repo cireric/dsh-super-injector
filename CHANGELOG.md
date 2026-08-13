@@ -2,6 +2,18 @@
 
 本项目版本与仓库提交对应，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.2.6] — 2026-08-14
+
+### 修复
+
+- **watch 自动重载前预检**（用户反馈"太自由容易自杀"）：build 半途/改错导致的损坏 lib 不可加载时**拒绝自动重载**（旧代码继续运行）+ `watch-precheck-blocked` 审计——与手动自重载的预检拦截同一道防线。实测：music-forge 构建半途被拦一次，build 完成后正常注入
+- **systemPrompt.context 重复注册容忍**：自重载 rebuild 不再因 `duplicate` 整体 failed（此前导致注入器死亡 + 自愈 3 连败）
+- **恢复路径验证**：注入器 failed 后用 **touch patch（include.refresh 进程内重装配）复活**——免杀进程的"延迟重启"（实测 6 秒恢复 + 自检 8/8）
+
+### 兼容
+
+- **DSH 0.1.0-rc.6（正式开源版）验证通过**：注入器一行未改直接运行，自检 8/8；peerDeps 范围声明（`>=0.0.1-rc <2`）在 rc.5 → rc.6 升级中实证"升级不报废"
+
 ## [0.2.4] — 2026-08-13
 
 ### 修复
