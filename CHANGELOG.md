@@ -38,6 +38,64 @@
 - 预防正式版：peerDeps 放宽（`@deepseek-ai/dsh-tools >=0.0.1-rc <2`、`cordis >=4.0.0-rc <5`）
 - 文档：README 新增「生态定位：官方之下的运行时标准层」章节
 
+## [0.2.2] — 2026-08-13
+
+### 新增
+
+- **INSTALL.md 傻瓜式安装手册**：Release 包 / git / 手动 patch 三方式 + 验证 + 10 行排查表 + 卸载回滚小节 + Windows（Git Bash/cmd 双语法）说明 + 版本号占位（`<版本>` 不写死）
+- **`[injected]` 标记**：`dev_plugin_status` 对运行时注入的插件标注（与 bundle 装配区分，hash id 不再难认）
+- **`dev_self_test` 热重载自包含**：重载自检插件自身（固定 specifier + 固定目录，缓存一致），不再依赖环境里的外部插件（如 engram）
+
+### 优化
+
+- `dev_self_test` 预期拒绝场景（节流/预检拦截）改 `[EXPECTED]` 前缀——计入 PASS，不再误导新手
+- client 状态区分：无 client 声明 → `client 跳过（属预期）`；有声明注册失败 → 真 `✗` + 诊断指引
+- `dev_uninject_plugin` 描述补"另写 profile patch disabled 条目（防 include.refresh 加回）"，与实测行为一致
+- 引导提示词补一行从零体验路径（dev_plugin_status → dev_self_test → dev_scaffold_plugin → dev_build_plugin → dev_inject_plugin → dev_uninject_plugin）
+
+### 修复
+
+- 注入 junction 悬空重建：`existsSync` 对悬空 junction 返回 false（跟随目标）导致 symlink EEXIST——改 `lstatSync` 判断链接存在 + `rmSync` 删除重建
+- `uninject` 幂等：已存在同名 disabled 条目时跳过（此前重复卸载会累积 patch 条目）
+- 自检 patch 清理：列表存在时不再追加 `[]`（防双顶层值回归）
+
+### 质量
+
+- 零上下文 subagent 三轮评测闭环：9/10 → 9.5/10 → **10/10**（七条 polish 全部落地 + 8/8 回归连续通过）
+
+## [0.2.1] — 2026-08-13
+
+### 优化
+
+- `dev_self_test` 预期拒绝场景改 `[EXPECTED]` 前缀（不误导新手）
+- client 状态区分「无声明（预期跳过）」与「有声明注册失败（真 ✗ + 诊断指引）」
+- 引导提示词补从零体验路径一行
+
+## [0.2.0] — 2026-08-13
+
+### 新增
+
+- **插件生产线三件套**：
+  - `dev_scaffold_plugin`：四种形态骨架（toolkit 工具包 / daemon-loop 守护循环(timer+LLM) / ui-panel UI 面板 / hybrid 混合）——peerDeps 范围声明、ctx.effect 规范、build.sh 模板（DSH_CHECKOUT 自动探测）
+  - `dev_build_plugin`：探测 checkout → tsc + tsdown（client）+ npm pack → tgz
+  - `dev_release_plugin`：gh release create + tag + tgz 附件 + notes 模板
+- **`dev_self_test` 一键回归**：注入 → 热重载 → 自重载节流 → 预检拦截 → 卸载即净 → patch 合法性，8 项全自动、自恢复无污染
+- **patch 写入守卫 `writePatch`**：统一 profile patch 写入（顶层 `[]` 兼容 + 幂等），杜绝 YAML 双顶层值
+- **审计日志轮转**：self-heal.log 超 1MB 自动滚动（保留 2 代）
+- **操作统计落盘**：`stats.json` 跨重启累计（dev_plugin_status 显示历史成功率）
+- **官方 entry 仲裁**：幽灵 entry 压制官方（disabled）时自动清理恢复（kill-zombie 自动化）
+- **README 插件开发指南**：「30 行写一个会思考的插件」+ 规范铁律 + 生态借鉴
+
+### 优化
+
+- watch 指纹轻量化：只扫 `.js`（跳过 .map/.d.ts，stat 开销省 50%+）
+- 引导提示词：静态到头（order -90）动态到尾（消息尾）缓存原则注释化
+
+### 修复
+
+- junction 悬空检测（inject 复用悬空链接 → import ENOENT）
+- `uninject` 幂等缺失（重复卸载累积 patch 条目）
+
 ## 未发布
 
 - 见 [README.md](./README.md) 与仓库提交历史
