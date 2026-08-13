@@ -275,7 +275,18 @@ export function apply(ctx: AppContext, config: Config): void {
       const selfEntry = findEntry(match)
       try {
         if (selfEntry?.fiber && typeof selfEntry.fiber.dispose === 'function') {
-          await selfEntry.fiber.dispose()
+          // ⚠️ 根修（实测）：loader 的 internal/plugin 监听（emitPluginDisposed
+          // 在 dispose 时也会 emit，旧 fiber uid 已置 null）会把「自我 dispose
+          // 但 loader 未在卸载」的 fiber 标 entry disabled（case 7）。豁免通道
+          // 是 entry._disposing（case 6：loader 正在卸载）。自重载是裸
+          // fiber.dispose()（不经 entry._dispose），必须先设 _disposing 标志，
+          // 否则官方 entry 被标 disabled（官方清单 enabled=false 的根因）。
+          selfEntry._disposing = 1
+          try {
+            await selfEntry.fiber.dispose()
+          } finally {
+            selfEntry._disposing = 0
+          }
         }
         for (const u of urls) Map.prototype.delete.call(loadCache, u)
       } catch { /* 清理失败不阻塞 */ }
@@ -296,39 +307,82 @@ export function apply(ctx: AppContext, config: Config): void {
               const nf = rebootCtx.registry.plugin(fresh, selfEntry.options.config ?? {}, () => [])
               nf.entry = selfEntry
               selfEntry.fiber = nf
+              // ⚠️ 清 disabled（实测）：rebuild 的新 fiber 触发 loader 的
+              // internal/plugin 监听 case 7，把 entry.options.disabled 标 true
+              // （官方清单显示 disabled 的根因；普通重载路径有 normalize 兜底，
+              // 唯独自重载路径漏了）。立即清除，保证官方清单 enabled=true。
+              try {
+                if (selfEntry.options.disabled !== undefined) delete selfEntry.options.disabled
+                const parent = selfEntry.parent
+                if (parent && Array.isArray(parent.data)) {
+                  for (const d of parent.data) {
+                    if (d && d.id === selfEntry.id && d.disabled !== undefined) delete d.disabled
+                  }
+                }
+              } catch { /* 清理失败不阻塞 */ }
               logger.info('[super-injector] 重启器重建完成 state=%s', nf.state)
             }
           } catch (error) {
             logger.error('[super-injector] 重启器重建失败: %s', String(error))
             console.error('[super-injector] 重启器重建失败:', error)
             auditLog('reboot-failed', String(error))
-            // ═══ 失败自愈（实测保障）：垃圾缓存/文件损坏/异步堵塞导致重建失败时，
-            // 注入器已缺席——自动重试装配（3 次，间隔 4s/8s/12s）：每次先 purge
-            // 毒化缓存（loadCache 残缺 job 会让 loader.create 复用失败态），再
-            // 用 rebootCtx.loader.create 新建 entry 重新装配（绕过坏缓存/坏
-            // fiber，走 loader 标准路径）。实测：单次 3s 窗口太紧（文件恢复
-            // 动作跨工具往返就超窗），重试给足修复窗口。
+            // ═══ 失败自愈（实测保障 + 官方路径优先）：垃圾缓存/文件损坏/异步
+            // 堵塞导致重建失败时，注入器已缺席——自动重试（3 次，间隔 4s/8s/12s）。
+            // ⚠️ 路径选择（实测教训）：loader.create 会新建**幽灵 entry**，与官方
+            // bundles entry 并存时 loader 对账防双实例会把官方 entry 标 disabled
+            // （官方清单里注入器变 disabled、实际跑在幽灵上——上次实测踩坑）。
+            // 所以自愈**优先走官方装配**：touch profile patch → loader 监听 →
+            // include.refresh 重装 bundles（官方 entry，无幽灵）；touch 无效时
+            // 才 fallback loader.create（保底复活，后续可清理幽灵）。
             try {
               const rebootCtx = (selfEntry?.ctx ?? ctx.root) as any
               const pkgName = selfEntry?.options?.name ?? '@dsh-external/dsh-super-injector'
-              const cfg = selfEntry?.options?.config ?? {}
+              const patchFile = join(dirname(profileNodeModules), 'cordis.patch.yml')
               let attempt = 0
               const heal = (): void => {
                 attempt += 1
                 void (async () => {
                   try {
-                    const lc = rebootCtx.loader.internal?.loadCache as Map<string, unknown> | undefined
-                    if (lc && typeof lc.delete === 'function') {
-                      for (const u of [...lc.keys()]) {
-                        if (typeof u === 'string' && decodeURIComponent(u).includes(pkgName)) {
-                          Map.prototype.delete.call(lc, u)
+                    // 第一步：touch profile patch 触发官方重装配（不产生幽灵 entry）
+                    if (attempt <= 3) {
+                      try {
+                        mkdirSync(dirname(patchFile), { recursive: true })
+                        appendFileSync(patchFile, `\n# super-injector heal ${Date.now()}\n`)
+                        // 给 include.refresh 一个窗口，然后验证官方 entry 是否复活
+                        await new Promise((r) => globalThis.setTimeout(r, 3000))
+                        let officialAlive = false
+                        try {
+                          for (const entry of rebootCtx.loader.entries()) {
+                            const o = entry.options
+                            if (o.group) continue
+                            if (String(o.name).includes('dsh-super-injector') && entry.fiber && FIBER_NAMES[entry.fiber.state] === 'active') {
+                              officialAlive = true
+                            }
+                          }
+                        } catch { /* 枚举失败按未复活处理 */ }
+                        if (officialAlive) {
+                          logger.info('[super-injector] 自愈：第 %d 次 touch patch 官方重装配生效（%s）', attempt, pkgName)
+                          opStats.selfHeal.ok += 1
+                          auditLog('heal-ok', `第 ${attempt} 次 touch patch 官方重装配成功（${pkgName}）`)
+                          return
                         }
+                        throw new Error('touch patch 后官方 entry 未复活')
+                      } catch (e) {
+                        // touch 无效 → 降级 loader.create（保底，会留幽灵 entry）
+                        const lc = rebootCtx.loader.internal?.loadCache as Map<string, unknown> | undefined
+                        if (lc && typeof lc.delete === 'function') {
+                          for (const u of [...lc.keys()]) {
+                            if (typeof u === 'string' && decodeURIComponent(u).includes(pkgName)) {
+                              Map.prototype.delete.call(lc, u)
+                            }
+                          }
+                        }
+                        await rebootCtx.loader.create({ name: pkgName, config: selfEntry?.options?.config ?? {} })
+                        logger.info('[super-injector] 自愈：第 %d 次 fallback loader.create 重新装配完成（%s）', attempt, pkgName)
+                        opStats.selfHeal.ok += 1
+                        auditLog('heal-ok', `第 ${attempt} 次 fallback loader.create 重新装配成功（${pkgName}）`)
                       }
                     }
-                    await rebootCtx.loader.create({ name: pkgName, config: cfg })
-                    logger.info('[super-injector] 自愈：第 %d 次 loader.create 重新装配完成（%s）', attempt, pkgName)
-                    opStats.selfHeal.ok += 1
-                    auditLog(`heal-ok`, `第 ${attempt} 次 loader.create 重新装配成功（${pkgName}）`)
                   } catch (e) {
                     logger.error('[super-injector] 自愈第 %d 次失败: %s', attempt, String(e))
                     opStats.selfHeal.fail += 1
@@ -339,7 +393,7 @@ export function apply(ctx: AppContext, config: Config): void {
                 })()
               }
               globalThis.setTimeout(heal, 4000)
-              logger.warn('[super-injector] 自愈已排程（4s 后第 1 次 loader.create，最多 3 次）')
+              logger.warn('[super-injector] 自愈已排程（4s 后第 1 次：touch patch 官方装配，最多 3 次）')
             } catch (e) {
               logger.error('[super-injector] 自愈排程失败: %s', String(e))
             }
