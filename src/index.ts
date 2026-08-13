@@ -2006,12 +2006,30 @@ export function apply(ctx: AppContext, config: Config): void {
       const prev = fingerprints.get(w.dir)
       if (prev !== undefined && prev !== fp) {
         fingerprints.set(w.dir, fp)
+        // ⚠️ 收紧（用户反馈：太自由容易自杀）：watch 自动重载前**预检新代码
+        // 可加载**——build 半途/改错导致的损坏 lib 不可加载时拒绝重载（旧
+        // 代码继续跑）+ 审计，而不是盲目重载把自己搞死（与手动自重载的
+        // 预检拦截同一道防线）。
         reloading = true
-        // match 用于 entry 查找，dir 用于 URL 匹配（loadCache key 是 file URL）
-        reloadPackage(w.match, w.dir)
-          .then(r => logger.info('[super-injector] %s', r))
-          .catch(e => logger.warn('[super-injector] %s', e instanceof Error ? e.stack : String(e)))
-          .finally(() => { reloading = false })
+        const libFile = join(w.dir, 'lib', 'index.js')
+        const precheck = existsSync(libFile)
+          ? ctx.loader.import(pathToFileURL(libFile).href, () => [])
+            .then((ns: unknown) => { const probe = ctx.loader.unwrapExports(ns); return !!(probe && (typeof probe === 'function' || typeof probe.apply === 'function')) })
+            .catch(() => false)
+          : Promise.resolve(false)
+        precheck.then((probeOk: boolean) => {
+          if (!probeOk) {
+            reloading = false
+            auditLog('watch-precheck-blocked', `自动重载预检失败（新代码不可加载），保持旧代码: ${w.dir}`)
+            logger.warn('[super-injector] 自动重载预检失败，跳过（旧代码继续运行）: %s', w.dir)
+            return
+          }
+          // match 用于 entry 查找，dir 用于 URL 匹配（loadCache key 是 file URL）
+          reloadPackage(w.match, w.dir)
+            .then(r => logger.info('[super-injector] %s', r))
+            .catch(e => logger.warn('[super-injector] %s', e instanceof Error ? e.stack : String(e)))
+            .finally(() => { reloading = false })
+        })
         return // 一轮只处理一个包，下轮继续
       }
       fingerprints.set(w.dir, fp)
@@ -2719,12 +2737,16 @@ export function apply(ctx: AppContext, config: Config): void {
   // - 动态内容（记忆检索/实时状态）→ 严禁进 system 头部：走消息尾追加
   //   （engram-relay 的尾部注入即此模式）或 system 最尾，变化只伤自身之后；
   // - 本段 text 必须保持编译期常量——任何每轮变化的动态拼接都会全灭前缀缓存。
-  ctx.systemPrompt.context({
-    name: 'dsh-super-injector',
-    order: -90,
-    // 引导（首次接触的 agent 从这段获得完整认知）：
-    // 1) dev_* 工具 = dsh-super-injector（运行时注入通道）；
-    // 2) 插件形态无上限：工具包 / 守护循环（timer+LLM 自主 agent loop）/
+  // ⚠️ 容忍重复注册（实测：自重载 rebuild 时旧 entry 的 context 可能残留，
+  // duplicate 会让 apply 整体 failed → 注入器死亡 + 自愈 3 连败）。duplicate
+  // 时跳过注册（新实例可运行），比 failed 强。
+  try {
+    ctx.systemPrompt.context({
+      name: 'dsh-super-injector',
+      order: -90,
+      // 引导（首次接触的 agent 从这段获得完整认知）：
+      // 1) dev_* 工具 = dsh-super-injector（运行时注入通道）；
+      // 2) 插件形态无上限：工具包 / 守护循环（timer+LLM 自主 agent loop）/
     //    UI 面板 / 混合形态，同一通道——注入即完整生效（host+UI）、可热
     //    重载与自重载、卸载即净；
     // 3) 插件自身的提示词/工具/循环皆可自我优化（改→build→重载闭环）；
@@ -2733,7 +2755,10 @@ export function apply(ctx: AppContext, config: Config): void {
     // 5) 使命：若注入器无法支撑此闭环，优先修复注入器。
     // ⚠️ 静态常量文本（缓存原则：静态到头）——严禁动态拼接。
     text: '本环境装有 dsh-super-injector（dev_* 工具）：任意本地插件包可运行时注入——工具包/守护循环（timer+LLM 自主 agent loop）/UI 面板/混合形态，同一通道；注入即完整生效（host+UI）、可热重载与自重载、卸载即净。插件自身的提示词/工具/循环皆可自我优化；建新插件优先克隆/借鉴/重构生态已有资源（dsh-external 仓库、已注入插件、官方 packages 模式），不重复造轮子。若注入器无法支撑此闭环，优先修复注入器。从零体验路径：dev_plugin_status → dev_self_test → dev_scaffold_plugin → dev_build_plugin → dev_inject_plugin → dev_uninject_plugin。',
-  })
+    })
+  } catch (e) {
+    logger.warn('[super-injector] systemPrompt.context 重复注册容忍（跳过，新实例继续运行）: %s', e instanceof Error ? e.message : String(e))
+  }
 
   logger.info('[super-injector] 就绪：watch %d 目录（%dms），autoRestore=%s', watches.length, intervalMs, String(config.autoRestore))
   // B: 每次装配后仲裁——幽灵压制官方时自动清理恢复（含历史残留场景）
