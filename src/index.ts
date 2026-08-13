@@ -182,6 +182,49 @@ export function apply(ctx: AppContext, config: Config): void {
    * @param urlMatch - URL 匹配子串（watch 自动重载传目录路径；loadCache key 是
    *   百分号编码的 file URL，包名不是 URL 子串，必须用目录路径匹配）
    */
+
+  // ═══ 自重载保护（防自毁）═══
+  // 自重载 = 注入器 dispose 自己 → 全局定时器重建。风险面：
+  // ① 短名误匹配（match='super'）会绕过 isSelf 走普通重载路径——普通路径在
+  //    dispose 自身 fiber 后继续执行必然炸（inactive context），等于自杀且无
+  //    重启器兜底——必须强制收敛到 isSelf 分支或拒绝；
+  // ② 连环自杀：无节流时自重载可被反复触发（含失败重试）——最小间隔锁；
+  // ③ watch 自动重载不应触发自重载（改注入器代码 → build → 自动自杀，无人
+  //    在场时注入器可能永久缺席）——watch 轮询显式跳过注入器自身。
+  const SELF_RELOAD_MIN_INTERVAL_MS = 10_000 // 自重载最小间隔（防连环自杀）
+  let selfReloading = false                    // 自杀→重建窗口锁（窗口内拒绝再次触发）
+  // ⚠️ 节流时间戳必须落盘：重启器重建 = 新 fiber = 新闭包，内存变量会归零
+  // （实测连续三次自重载都没被拦）。文件状态跨实例持久。
+  const selfReloadStateFile = join(dirname(registryFile), 'self-reload.json')
+
+  function readSelfReloadState(): { at: number } {
+    try {
+      const raw = JSON.parse(readFileSync(selfReloadStateFile, 'utf8')) as { at?: number }
+      return { at: typeof raw.at === 'number' ? raw.at : 0 }
+    } catch {
+      return { at: 0 }
+    }
+  }
+
+  function writeSelfReloadState(at: number): void {
+    try {
+      mkdirSync(dirname(selfReloadStateFile), { recursive: true })
+      writeFileSync(selfReloadStateFile, JSON.stringify({ at }, null, 2), 'utf8')
+    } catch { /* 状态写失败不阻塞（退化为窗口锁保护） */ }
+  }
+
+  /** 目标 entry 名是否命中注入器自身（match 或匹配 entry 含注入器名）。 */
+  function matchesSelf(match: string): boolean {
+    if (String(match).includes('dsh-super-injector')) return true
+    for (const entry of ctx.loader.entries()) {
+      const o = entry.options
+      if (o.group) continue
+      if (!String(o.name).includes('dsh-super-injector')) continue
+      if (String(o.name).includes(match) || String(o.id).includes(match)) return true
+    }
+    return false
+  }
+
   async function reloadPackage(match: string, urlMatch?: string): Promise<string> {
     const internal = ctx.loader.internal
     if (!internal) return 'ERROR: loader.internal 不可用'
@@ -202,8 +245,19 @@ export function apply(ctx: AppContext, config: Config): void {
     // 句柄，不锁定 lib 文件），再用**全局 setTimeout**（不属于任何 fiber
     // 的 disposables，dispose 不会清它）延迟重建——自杀后生命周期由全局
     // 定时器延续，直到重建结束。
-    const isSelf = String(match).includes('dsh-super-injector')
+    const isSelf = matchesSelf(match)
     if (isSelf) {
+      // 防自毁①：窗口锁——自杀→重建期间拒绝再次自重载
+      if (selfReloading) {
+        return 'ERROR: 自重载窗口进行中（自杀→重建约 1-2 秒），请稍后再试——防止连环自杀'
+      }
+      // 防自毁②：节流（文件持久化，跨自重载实例）——最小间隔内拒绝
+      const since = Date.now() - readSelfReloadState().at
+      if (since < SELF_RELOAD_MIN_INTERVAL_MS) {
+        return `ERROR: 自重载节流：距上次仅 ${Math.round(since / 1000)}s（最小间隔 ${SELF_RELOAD_MIN_INTERVAL_MS / 1000}s）——防止循环自杀`
+      }
+      selfReloading = true
+      writeSelfReloadState(Date.now())
       const selfEntry = findEntry(match)
       try {
         if (selfEntry?.fiber && typeof selfEntry.fiber.dispose === 'function') {
@@ -233,11 +287,27 @@ export function apply(ctx: AppContext, config: Config): void {
           } catch (error) {
             logger.error('[super-injector] 重启器重建失败: %s', String(error))
             console.error('[super-injector] 重启器重建失败:', error)
+          } finally {
+            // 防自毁③：无论成败都释放窗口锁（失败时注入器已缺席，锁必须
+            // 释放以便后续手动/自动恢复路径可重新装配）
+            selfReloading = false
           }
         })()
       }, 100)
       void planned
       return `OK: 注入器已自杀（dispose + 释放文件句柄），重建已排程（100ms 后由全局定时器执行——重启器生命周期独立于自身 fiber）`
+    }
+
+    // 防自毁④：非自重载路径（普通重载）若匹配到注入器自身 entry → 拒绝。
+    // 普通路径会在 dispose 自身 fiber 后继续跑注入器 ctx 的代码（inactive
+    // context 必然炸），且无重启器兜底——等于无保护的自我处决。
+    for (const entry of ctx.loader.entries()) {
+      const o = entry.options
+      if (o.group) continue
+      if (!String(o.name).includes('dsh-super-injector')) continue
+      if (String(o.name).includes(match) || String(o.id).includes(match)) {
+        return 'ERROR: 重载目标命中注入器自身，但未走自重载路径（匹配串需含 dsh-super-injector）。已拒绝——防止无保护自毁'
+      }
     }
 
     const oldJob = loadCache.get(entryUrl)
@@ -1074,6 +1144,9 @@ export function apply(ctx: AppContext, config: Config): void {
       if (!watchList.some(w => w.dir === e.dir)) watchList.push({ dir: e.dir, match: e.name })
     }
     for (const w of watchList) {
+      // 防自毁⑤：watch 自动重载永不触发注入器自重载（改注入器代码 → build →
+      // 自动自杀无人兜底）；自重载只允许显式 dev_reload_package 调用。
+      if (String(w.match).includes('dsh-super-injector')) continue
       const fp = fingerprintOf(join(w.dir, 'lib'))
       if (fp === null) continue
       const prev = fingerprints.get(w.dir)
