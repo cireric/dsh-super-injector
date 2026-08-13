@@ -1461,15 +1461,28 @@ export function apply(ctx: AppContext, config: Config): void {
     return entry.fiber ? (FIBER_NAMES[entry.fiber.state] ?? `state:${entry.fiber.state}`) : 'no-fiber'
   }
 
-  /** 等待 fiber 稳定（active/failed），最多 timeoutMs；返回最终状态。 */
+  /** 等待 fiber 稳定（active/failed），最多 timeoutMs；返回最终状态。
+   *  ⚠️ 超时不等于失败：fiber 可能仍在 loading（插件 apply 慢/异步初始化）——
+   *  文案区分"真失败"（failed）与"检查超时"（功能以实际为准，可
+   *  dev_plugin_status 复核）。 */
   function waitFiberStable(entry: any, timeoutMs = 3000): Promise<string> {
     return new Promise((resolve) => {
+      let retried = false
+      let start = Date.now()
       const check = () => {
         const st = stateOf(entry)
-        if (st === 'active' || st === 'failed') { clearInterval(iv); resolve(st); return }
-        if (Date.now() - start > timeoutMs) { clearInterval(iv); resolve(st + '（超时未稳定）'); return }
+        if (st === 'active') { clearInterval(iv); resolve(st); return }
+        if (st === 'failed') { clearInterval(iv); resolve(st + '（失败）'); return }
+        if (Date.now() - start > timeoutMs) {
+          clearInterval(iv)
+          // 超时但非 failed：多数是 loading 未转完（apply 异步）——
+          // 再给 2 秒重试一次，仍不稳定则如实标注"检查超时（功能以实际为准）"
+          if (retried) { resolve(st + '（检查超时，功能以实际为准）'); return }
+          retried = true
+          start = Date.now()
+          return
+        }
       }
-      const start = Date.now()
       const iv = setInterval(check, 50)
       check()
     })
@@ -2144,7 +2157,12 @@ export function apply(ctx: AppContext, config: Config): void {
       const entry = findEntry(args.packageName)
       const before = entry ? stateOf(entry) : '（未找到）'
       const result = await withOpLock(() => reloadPackage(args.packageName!))
-      const after = entry ? await waitFiberStable(entry) : '（未找到）'
+      // ⚠️ 误报修复（2026-08 实测 "disposed（超时未稳定）" 假象）：重载后
+      // loader 可能替换/重建 entry 对象——**旧 entry 引用指向已 dispose 的
+      // 旧 fiber**，waitFiberStable 轮询 3 秒都读旧状态 → 误报。必须重新
+      // findEntry 拿最新 entry 再查（新 fiber 已挂 entry.fiber，await 已完成）。
+      const freshEntry = findEntry(args.packageName)
+      const after = freshEntry ? await waitFiberStable(freshEntry) : '（未找到）'
       return result + '\n--- 重载前后状态 ---\nbefore: [' + before + ']\nafter: [' + after + ']'
     },
   }))
