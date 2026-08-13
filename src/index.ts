@@ -31,6 +31,7 @@ import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSy
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
+import { pathToFileURL } from 'node:url'
 
 // ═══════════════════════════════════════════════════════════════════════
 // A: 插件生产线模板（dev_scaffold_plugin）——四种形态骨架：
@@ -785,11 +786,43 @@ export function apply(ctx: AppContext, config: Config): void {
     const loadCache = internal.loadCache as Map<string, any>
 
     const urlKey = (urlMatch ?? match).replace(/\\/g, '/')
-    const urls = [...loadCache.keys()].filter((u) => {
+    let urls = [...loadCache.keys()].filter((u) => {
       if (typeof u !== 'string') return false
       return decodeURIComponent(u).includes(urlKey)
     })
-    if (!urls.length) return `INFO: 缓存中无匹配 "${urlKey}" 的模块`
+    // ═══ P0 根治（外部测评确认）：缓存无匹配不再 INFO 退出 ═══
+    // 缓存丢失场景（并行 build/自检交错 purge、进程内 loadCache 被清）会让
+    // 自重载/热重载直接失效（实测多次 + 测评复现）。降级：从磁盘 URL 直接
+    // import（junction 路径 / urlMatch 目录的 lib/index.js），loader.import
+    // 会重新解析磁盘文件并填充缓存——重载流程继续，链路自愈。
+    if (urls.length === 0) {
+      let loaded = false
+      try {
+        const entry = findEntry(match)
+        const name = entry?.options?.name
+        const candidates: string[] = []
+        if (name) {
+          const parts = name.startsWith('@') ? name.split('/') : [name]
+          candidates.push(join(profileNodeModules, ...parts, 'lib', 'index.js'))
+        }
+        if (urlMatch) candidates.push(join(urlMatch, 'lib', 'index.js'))
+        for (const lib of candidates) {
+          if (existsSync(lib)) {
+            await ctx.loader.import(pathToFileURL(lib).href, () => [])
+            loaded = true
+            break
+          }
+        }
+      } catch { /* 降级失败继续走下面判断 */ }
+      if (loaded) {
+        urls = [...loadCache.keys()].filter((u) => {
+          if (typeof u !== 'string') return false
+          return decodeURIComponent(u).includes(urlKey)
+        })
+        auditLog('cache-miss-healed', `缓存无匹配已降级从磁盘加载（${urlKey}）`)
+      }
+    }
+    if (!urls.length) return `INFO: 缓存中无匹配且磁盘降级失败 "${urlKey}" 的模块`
     const entryUrl = urls.find(u => u.endsWith('/lib/index.js'))
     if (!entryUrl) return `ERROR: 未找到入口 lib/index.js（匹配 ${urls.length} 个模块）`
 
@@ -1551,12 +1584,14 @@ export function apply(ctx: AppContext, config: Config): void {
   const statsFile = join(dirname(registryFile), 'stats.json')
 
   interface OpStat { ok: number; fail: number }
+  interface FailRecord { kind: string; at: string; reason: string }
   interface OpStatsMap {
     inject: OpStat
     reload: OpStat
     uninject: OpStat
     install: OpStat
     selfHeal: OpStat
+    lastFailures: FailRecord[]
   }
   const EMPTY_STATS: OpStatsMap = {
     inject: { ok: 0, fail: 0 },
@@ -1564,21 +1599,24 @@ export function apply(ctx: AppContext, config: Config): void {
     uninject: { ok: 0, fail: 0 },
     install: { ok: 0, fail: 0 },
     selfHeal: { ok: 0, fail: 0 },
+    lastFailures: [],
   }
 
   function loadStats(): OpStatsMap {
     try {
       const raw = JSON.parse(readFileSync(statsFile, 'utf8')) as OpStatsMap
       const num = (v: unknown): number => (typeof v === 'number' ? v : 0)
+      const fails = Array.isArray(raw?.lastFailures) ? raw.lastFailures.slice(-5) : []
       return {
         inject: { ok: num(raw?.inject?.ok), fail: num(raw?.inject?.fail) },
         reload: { ok: num(raw?.reload?.ok), fail: num(raw?.reload?.fail) },
         uninject: { ok: num(raw?.uninject?.ok), fail: num(raw?.uninject?.fail) },
         install: { ok: num(raw?.install?.ok), fail: num(raw?.install?.fail) },
         selfHeal: { ok: num(raw?.selfHeal?.ok), fail: num(raw?.selfHeal?.fail) },
+        lastFailures: fails,
       }
     } catch {
-      return { ...EMPTY_STATS, inject: { ...EMPTY_STATS.inject }, reload: { ...EMPTY_STATS.reload }, uninject: { ...EMPTY_STATS.uninject }, install: { ...EMPTY_STATS.install }, selfHeal: { ...EMPTY_STATS.selfHeal } }
+      return { ...EMPTY_STATS, inject: { ...EMPTY_STATS.inject }, reload: { ...EMPTY_STATS.reload }, uninject: { ...EMPTY_STATS.uninject }, install: { ...EMPTY_STATS.install }, selfHeal: { ...EMPTY_STATS.selfHeal }, lastFailures: [] }
     }
   }
 
@@ -1639,11 +1677,16 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
-  /** 记录一次操作结果（ok=true 记成功，否则记失败）；落盘跨重启累计。 */
-  function recordOp(kind: keyof typeof opStats, ok: boolean): void {
+  type OpKind = 'inject' | 'reload' | 'uninject' | 'install' | 'selfHeal'
+
+  /** 记录一次操作结果（ok=true 记成功，否则记失败 + 失败原因可审计）；落盘跨重启累计。 */
+  function recordOp(kind: OpKind, ok: boolean, reason?: string): void {
     const bucket = opStats[kind]
     if (ok) bucket.ok += 1
-    else bucket.fail += 1
+    else {
+      bucket.fail += 1
+      opStats.lastFailures = [...opStats.lastFailures.slice(-4), { kind, at: new Date().toISOString(), reason: reason ?? '' }]
+    }
     saveStats()
   }
 
@@ -1701,7 +1744,8 @@ export function apply(ctx: AppContext, config: Config): void {
   async function inject(dir: string): Promise<string> {
     const absDir = resolve(dir)
     const pkgPath = join(absDir, 'package.json')
-    if (!existsSync(pkgPath)) return `ERROR: ${absDir} 下无 package.json（需要插件包目录）`
+    if (!existsSync(absDir) || !statSync(absDir).isDirectory()) return `ERROR: 目录不存在或不可访问: ${absDir}`
+    if (!existsSync(pkgPath)) return `ERROR: ${absDir} 存在但没有 package.json（不是插件包目录）`
     let pkg: { name?: string }
     try {
       pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
@@ -1833,7 +1877,12 @@ export function apply(ctx: AppContext, config: Config): void {
       removeClientRow(fullName)
       steps.push('client 模块表已清理')
     }
-    recordOp('uninject', steps.some(s => s.startsWith('entry 已卸载')))
+    // ⚠️ 统计口径（压测发现②）：「无匹配 entry」= no-op 幂等跳过——既不计
+    // ✓ 也不计 ✗（避免高估成功；真失败仍计 ✗）。此前记 fail 产生 9✗ 假失败。
+    const entryUnloaded = steps.some(s => s.startsWith('entry 已卸载'))
+    const noMatch = steps.some(s => s.startsWith('（无匹配 entry）'))
+    if (entryUnloaded) recordOp('uninject', true)
+    else if (!noMatch) recordOp('uninject', false)
     return 'OK: 卸载完成\n- ' + steps.join('\n- ')
   }
 
@@ -1900,6 +1949,10 @@ export function apply(ctx: AppContext, config: Config): void {
   // watch 源 = 配置 watches + 注入清单（registry）——注入即自动 watch，
   // 自重载后动态 watch 不丢失（registry 持久）；改代码 → build → ~1.5s 自动生效。
   const fingerprints = new Map<string, string>()
+  // ⚠️ P1（压测发现③）：目录消失/悬空（junction 指向的源被删/改名）时
+  // fingerprintOf 返回 null——若盲目跳过静默，目录反复消失/恢复会产生乒乓
+  // reload 且虚增 ✓、无审计。这里抑制重载 + 审计一次（30s 节流防刷屏）。
+  const lastDangleTs = new Map<string, number>()
   let reloading = false
   ctx.setInterval(() => {
     if (reloading) return
@@ -1912,7 +1965,16 @@ export function apply(ctx: AppContext, config: Config): void {
       // 自动自杀无人兜底）；自重载只允许显式 dev_reload_package 调用。
       if (String(w.match).includes('dsh-super-injector')) continue
       const fp = fingerprintOf(join(w.dir, 'lib'))
-      if (fp === null) continue
+      if (fp === null) {
+        const now = Date.now()
+        const prevDang = lastDangleTs.get(w.dir)
+        if (prevDang === undefined || now - prevDang > 30000) {
+          lastDangleTs.set(w.dir, now)
+          auditLog('watch-dangling', `目录不可读，跳过自动重载（源被删/悬空 junction）: ${w.dir}`)
+        }
+        continue
+      }
+      lastDangleTs.delete(w.dir)
       const prev = fingerprints.get(w.dir)
       if (prev !== undefined && prev !== fp) {
         fingerprints.set(w.dir, fp)
@@ -2007,14 +2069,16 @@ export function apply(ctx: AppContext, config: Config): void {
     name: 'dev_uninject_plugin',
     description: '超级模组卸载器：卸载已注入的插件包——卸 loader entry（fiber dispose，工具/监听全清理）→ 清注入清单 → 删 profile junction → 另写 profile patch disabled 条目（防 include.refresh 加回），免重启。参数 = 包名子串（如 dsh-toy-supermod）',
     parameters: {
-      match: { type: 'string', description: '包名/路径子串（如 dsh-toy-supermod 或 @dsh-external/dsh-toy-supermod）' },
+      match: { type: 'string', required: true, description: '包名/路径子串（如 dsh-toy-supermod 或 @dsh-external/dsh-toy-supermod）' },
     },
     output: {
       schema: { type: 'string' },
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
     async execute(args: { match: string }) {
-      return withOpLock(() => uninject(args.match))
+      const match = String(args?.match ?? '').trim()
+      if (!match) return 'ERROR: match 必填（包名/路径子串）'
+      return withOpLock(() => uninject(match))
     },
   }))
 
@@ -2079,10 +2143,12 @@ export function apply(ctx: AppContext, config: Config): void {
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
     async execute() {
-      const summary = Object.entries(opStats)
-        .map(([k, v]) => `${k} ${v.ok}✓/${v.fail}✗`)
-        .join(' | ')
-      return `===== 操作统计（本次运行期）=====\n${summary}${auditSummary()}\n\n===== 当前已装配插件（loader entries）=====\n` + listPlugins()
+      const kinds = ['inject', 'reload', 'uninject', 'install', 'selfHeal'] as const
+      const summary = kinds.map((k) => `${k} ${opStats[k].ok}✓/${opStats[k].fail}✗`).join(' | ')
+      const failLines = opStats.lastFailures.length
+        ? '\n===== 最近失败（可审计）=====\n' + opStats.lastFailures.map((f) => `[${f.kind} ${f.at}] ${f.reason || '（无原因）'}`).join('\n')
+        : ''
+      return `===== 操作统计（跨重启累计）=====\n${summary}${failLines}${auditSummary()}\n\n===== 当前已装配插件（loader entries）=====\n` + listPlugins()
     },
   }))
 
