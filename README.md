@@ -10,7 +10,7 @@ DSH 生态的 **BepInEx 式模组注入入口**：运行时把任意本地插件
 
 ### 方式 A：Release 包（推荐，免构建）
 
-从 [Releases](https://github.com/dsh-external/dsh-super-injector/releases) 下载
+从 [Releases](https://github.com/yjh051108/dsh-super-injector/releases) 下载
 `dsh-external-dsh-super-injector-0.0.1.tgz`，解压得到插件目录（含 `lib/` 与 `cordis.patch.yml`），然后：
 
 ```bash
@@ -24,7 +24,7 @@ dsh plugin --profile web add <解压目录>
 ### 方式 B：git 装配
 
 ```bash
-dsh plugin --profile web add github:dsh-external/dsh-super-injector
+dsh plugin --profile web add github:yjh051108/dsh-super-injector
 ```
 
 ### 方式 C：引导装配（源码方式，只需一次）
@@ -34,7 +34,7 @@ dsh plugin --profile web add github:dsh-external/dsh-super-injector
 ```yaml
 - insert:
     - id: dsh-super-injector
-      name: '@dsh-external/dsh-super-injector'
+      name: '@yjh051108/dsh-super-injector'
       config: {}
 ```
 
@@ -193,5 +193,5 @@ export function apply(ctx: AppContext): void {
 
 ---
 
-**仓库**：https://github.com/dsh-external/dsh-super-injector
-**Release**：https://github.com/dsh-external/dsh-super-injector/releases
+**仓库**：https://github.com/yjh051108/dsh-super-injector
+**Release**：https://github.com/yjh051108/dsh-super-injector/releases
