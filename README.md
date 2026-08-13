@@ -1,19 +1,62 @@
 # dsh-super-injector — 超级模组注入器
 
 DSH 生态的 **BepInEx 式模组注入入口**：运行时把任意本地插件包注入运行中的 web，
-不碰 patch / package.json / bundles 列表、不重启进程。
+不碰 patch / package.json / bundles 列表、不重启进程。**注入即完整生效（host 工具 + client UI）。**
 
 > 灵感：官方装配机制（profile bundle / repository-plugin）是唯一的"官方入口"，就像游戏
 > 只有启动器能装模组。本插件打破这一点——引导器走官方入口装一次，之后**万物皆可运行时注入**。
 
+## 安装（三选一）
+
+### 方式 A：Release 包（推荐，免构建）
+
+从 [Releases](https://github.com/dsh-external/dsh-super-injector/releases) 下载
+`dsh-external-dsh-super-injector-0.0.1.tgz`，解压得到插件目录（含 `lib/` 与 `cordis.patch.yml`），然后：
+
+```bash
+# 官方装配（重启后由 bundles 接管，生产态）
+dsh plugin --profile web add <解压目录>
+
+# 或运行时注入（免重启，开发态；需任一环境已常驻注入器）
+# 对 AI 说：dev_inject_plugin <解压目录>
+```
+
+### 方式 B：git 装配
+
+```bash
+dsh plugin --profile web add github:dsh-external/dsh-super-injector
+```
+
+### 方式 C：引导装配（源码方式，只需一次）
+
+在 `~/.dsh/profiles/web/cordis.patch.yml` 添加：
+
+```yaml
+- insert:
+    - id: dsh-super-injector
+      name: '@dsh-external/dsh-super-injector'
+      config: {}
+```
+
+引导器常驻后，任意超级模组随取随用，无需再碰官方配置。
+
+## 兼容性
+
+- **不硬编码 DSH 版本**：peerDependencies 全部为范围声明
+  （`@deepseek-ai/dsh-tools: >=0.0.1-rc <2`、`cordis: >=4.0.0-rc <5`）——DSH 升级不报废。
+- 已适配服务改名：`webServer`（原 httpServer）、`compaction`（原 compact）。
+
 ## 特性
 
-- 🔥 **热重载**：写 → build → 注入 → 下一 step 工具即见；`dev_reload_package` 整包重载（清缓存 → 重新 import → 重建 fiber），改代码约 1.5 秒自动生效，失败自动回滚保留旧代
-- 🧪 **开发侧挂区（staging）**：测试工具挂"后侧"不进 tools schema、缓存零污染；`dev_stage_call` 测试、`dev_stage_promote` 一键转正、`dev_stage_demote` 撤回
-- 🧹 **一键卸载**：`dev_uninject_plugin` fiber 全清理（工具/监听/路由）→ 清注入清单 → 删 junction，免重启；卸载 bundle 插件自动在 profile patch 写 disabled 阻断自装配
+- 🔥 **热重载 + 自重载**：`dev_reload_package` 整包重载（清缓存 → 重新 import → 重建 fiber，失败回滚保留旧代）；注入器自身也支持自重载（自杀 → 全局定时器重建）
+- 🤖 **自动 watch**：注入即自动监听插件目录，改代码 build 后约 1.5 秒自动重载（无需手动触发）
+- 🖥️ **注入插件 UI 完整生效**：清除 loader 幽灵 entry 隔离（normalizeEntry），client 模块补扫/联动/卸载清理——注入的插件 host 工具 + 图谱/面板等 UI 全部可用
+- 🧪 **开发侧挂区（staging）+ 持久化**：测试工具挂"后侧"不进 tools schema、缓存零污染；`dev_stage_promote` 一键转正；staging 落盘，**自重载/重启后转正工具自动恢复**
+- 🧹 **一键卸载**：`dev_uninject_plugin` fiber 全清理（工具/监听/路由/client 表）→ 清注入清单 → 删 junction，免重启
 - 🛠️ **路由自愈**：`dev_clear_routes` 直捣 webserver 内部路由表，热重载残留的孤儿路由免重启清除
-- 🔁 **重启自动恢复**：注入清单持久化（`~/.dsh/super-injector/registry.json`），web 重启后自动归位，不用重装
-- 🛡️ **失败可重试**：`hasActiveEntry` 权威防重 + 失败残留缓存自动清理；强制登记守卫拦截裸注册
+- 🔁 **重启自动恢复**：注入清单持久化（`~/.dsh/super-injector/registry.json`），web 重启后自动归位
+- 📊 **操作自检**：每次注入/重载/安装返回 `host ✓ / client ✓` 双验证；`dev_plugin_status` 含操作成功率统计
+- 🛡️ **失败可重试**：`hasActiveEntry` 权威防重 + 失败残留缓存自动清理 + 残留 entry 自动清理
 
 ## 与 dsh-evolve 的定位差异（生态互补）
 
@@ -39,29 +82,16 @@ DSH 生态的 **BepInEx 式模组注入入口**：运行时把任意本地插件
 | marisa | agent 面工具链 | 临时插件 → 持久化插件的固化桥 |
 | mygo | 受管对象层 | 插件生命周期对象化（锁定/启停/依赖图） |
 | dsh-evolve | 创造模式 | agent 现场长出单文件能力 |
-| **dsh-super-injector** | **运行时手术台** | **开发闭环全家桶：注入 / 热重载 / 侧挂转正 / 卸载 / 路由自愈** |
+| **dsh-super-injector** | **运行时手术台** | **开发闭环全家桶：注入 / 热重载 / 侧挂转正 / 卸载 / 路由自愈 / UI 联动** |
 
-**设计原则（吃下这块的底气）**：
+**设计原则**：
 
 1. **不发明协议**：注入的是标准插件包（package.json + lib/），格式就是官方包格式，装上即官方语义；
 2. **双路径，尊重"配置唯一"**：运行时注入（免重启，开发态）↔ `dev_install_package` 落 profile bundles（重启后由官方接管，生产态）——注入清单只是**运行时恢复缓存**，不是第二安装数据库；
 3. **模型可驱动**：dev_* 全是工具，agent 自己注入/卸载/转正——正踩在官方"agent 自己管理运行时"的方向上；
-4. **可逆且自愈**：注入可回滚（失败保旧代）、卸载即净（fiber 全清理）、残留可自愈（路由/缓存自动清理）。
+4. **可逆且自愈**：注入可回滚（失败保旧代）、卸载即净（fiber 全清理）、残留可自愈（路由/缓存/entry 自动清理）。
 
 **目标**：成为官方装配机制之下、生态事实标准的**运行时管理层**——"启动器装模组"只是起点，注入器让 DSH 拥有"**万物可注入、注入可回滚、改完即生效**"的 Mod 级体验。
-
-## 引导装配（只需一次）
-
-在 `~/.dsh/profiles/web/cordis.patch.yml` 添加：
-
-```yaml
-- insert:
-    - id: dsh-super-injector
-      name: '@dsh-external/dsh-super-injector'
-      config: {}
-```
-
-引导器常驻后，任意超级模组随取随用，无需再碰官方配置。
 
 ## 工具全家桶（全部免重启）
 
@@ -71,8 +101,8 @@ DSH 生态的 **BepInEx 式模组注入入口**：运行时把任意本地插件
 | `dev_uninject_plugin` | 一键卸载注入模组（fiber dispose 全清理；bundle 插件自动写 disabled 阻断自装配） |
 | `dev_injected_list` | 列出注入清单 |
 | `dev_install_package` | 热装配本地 bundle 插件（profile package.json + junction + loader.create，重启后由 bundles 列表正常装配） |
-| `dev_reload_package` | 整包热重载（清缓存 → 重新 import → 重建 fiber，失败回滚保留旧代） |
-| `dev_plugin_status` | 已装配插件清单与 fiber 状态 |
+| `dev_reload_package` | 整包热重载（清缓存 → 重新 import → 重建 fiber，失败回滚保留旧代；含自重载） |
+| `dev_plugin_status` | 已装配插件清单、fiber 状态与操作成功率统计 |
 | `dev_clear_routes` | webserver 路由残留自愈（按 path 前缀删除孤儿路由） |
 | `dev_stage_add` | 开发侧挂：测试工具挂后侧（不进 tools schema，缓存零污染） |
 | `dev_stage_call` | 调用侧挂工具测试 |
@@ -82,26 +112,29 @@ DSH 生态的 **BepInEx 式模组注入入口**：运行时把任意本地插件
 
 ## 典型工作流
 
-**装模组**：写好插件包（package.json + lib/ 产物）→ 对 AI 说 `dev_inject_plugin`（参数 = 插件包绝对路径）→ 当场生效（下一 step 工具可见）。
+**装模组**：拿到插件包（package.json + lib/ 产物）→ 对 AI 说 `dev_inject_plugin`（参数 = 插件包绝对路径）→ 当场生效（下一 step 工具可见）。
 
-**开发迭代**：改代码 → `dev_reload_package` 热重载（约 1.5 秒生效）→ 验证 → 稳定后 `dev_stage_promote` 一键转正。
+**开发迭代**：改代码 → build → 自动 watch 约 1.5 秒自动重载（或 `dev_reload_package`）→ 验证 → 稳定后 `dev_stage_promote` 一键转正。
 
-**卸载**：`dev_uninject_plugin`（参数 = 包名子串）→ 工具/监听/路由全清，免重启。
+**卸载**：`dev_uninject_plugin`（参数 = 包名子串）→ 工具/监听/路由/client 表全清，免重启。
 
 ## 机制
 
 1. **junction 链接**插件包到 `~/.dsh/profiles/web/node_modules`（loader 标准解析路径）；
 2. **`ctx.loader.create({ name, config })`** 运行时装配（完整 ctx）；
-3. **清单持久化**（`~/.dsh/super-injector/registry.json`），重启后自动恢复注入。
+3. **清单持久化**（`~/.dsh/super-injector/registry.json`），重启后自动恢复注入；
+4. **client 联动**：注入/重载后清除 entry disabled 标记并补扫 client 模块表（`client-modules.processOne`），浏览器端 bundle rev 联动更新。
 
 ## 踩坑记录
 
-- **插件包必须自带依赖链接**：`lib/` 里 `import '@deepseek-ai/dsh-tools'` 等从包自身 `node_modules` 解析——照 dsh-engram-relay 的 build.sh 建 junction 到 checkout 包（如 `node_modules/@deepseek-ai/dsh-tools → <checkout>/packages/core/tools`）；
+- **插件包必须自带依赖链接**：`lib/` 里 `import '@deepseek-ai/dsh-tools'` 等从包自身 `node_modules` 解析——照 build.sh 建 junction 到 checkout 包（如 `node_modules/@deepseek-ai/dsh-tools → <checkout>/packages/core/tools`）；
+- **client bundle 需单独构建**：host 侧 `bash scripts/build.sh`（tsc），client 侧 `npm run build:client`（tsdown，产物 `lib/client.js`）——注入插件要出 UI 必须两步都构建；
 - **失败 import 会毒化重试**：loadCache 残留残缺 job 导致同名重载复用失败态——注入前 `purgeCache` 清理；
 - **资源注册必须挂 `ctx.effect`**：`reloadPackage` 重建失败若报 `duplicate / already registered`，说明资源是裸注册——挂 `ctx.effect` 后热重载才能正确清理重建；
-- 注入的插件不进 loader 配置持久化——重启后由注入器自动恢复（引导器常驻）；
-- 私有内测项目，欢迎群内交流 🐋
+- **client 操作必须用完整包名**：`client-modules.processOne` 对 `entry.options.name` 精确匹配，传短名会静默注册失败；
+- 注入的插件不进 loader 配置持久化——重启后由注入器自动恢复（引导器常驻）。
 
 ---
 
 **仓库**：https://github.com/dsh-external/dsh-super-injector
+**Release**：https://github.com/dsh-external/dsh-super-injector/releases
