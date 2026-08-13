@@ -2073,6 +2073,25 @@ export function apply(ctx: AppContext, config: Config): void {
     async execute(args: { dir: string }) {
       const dir = String(args.dir ?? '').trim()
       if (!dir) return 'ERROR: dir 必填（插件包目录绝对路径）'
+      // ⚠️ 注入前 client 骨架校验（2026-08 pixel-forge 事件教训：参考源污染
+      // 会把"缺 inject/name"的老坑传播给新插件——注入即检查，有问题先修再注入）
+      try {
+        const clientSrcPath = join(resolve(dir), 'src', 'client', 'index.ts')
+        if (existsSync(clientSrcPath)) {
+          const src = readFileSync(clientSrcPath, 'utf8')
+          const problems: string[] = []
+          if (!/export const inject\s*=\s*\[[^\]]*'slots'/.test(src)) {
+            problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
+          }
+          if (!/register\(\{[\s\S]*?name:\s*['"]conversation\.view['"]/.test(src)) {
+            problems.push("slots.register 缺 name: 'conversation.view'（= slot 名，缺了报 slot undefined is not declared）")
+          }
+          if (problems.length > 0) {
+            return '⚠️ 注入前校验发现 client 骨架问题（不阻断注入，但 Tab 大概率不生效）：\n- ' + problems.join('\n- ')
+              + '\n建议先修复再注入（参照脚手架模板 SCAFFOLD_UI_CLIENT 或 dsh-engram-relay/src/client/index.ts）'
+          }
+        }
+      } catch { /* 校验失败不阻断注入（无 src 目录时跳过） */ }
       return withOpLock(() => inject(dir))
     },
   }))
@@ -2396,8 +2415,25 @@ export function apply(ctx: AppContext, config: Config): void {
           mkdirSync(dirname(full), { recursive: true })
           writeFileSync(full, content, 'utf8')
         }
+        // ⚠️ 生成后自动校验（2026-08 pixel-forge 事件教训：client 骨架两坑
+        // ——inject 服务声明 + register name 字段。生成即校验，模板回归/
+        // 参考源污染当场暴露，不静默传播到下游会话）
+        if (form === 'ui-panel' || form === 'hybrid') {
+          const clientSrc = readFileSync(join(targetDir, 'src/client/index.ts'), 'utf8')
+          const problems: string[] = []
+          if (!/export const inject\s*=\s*\[[^\]]*'slots'/.test(clientSrc)) {
+            problems.push("缺 export const inject = ['slots']（cordis 服务注入声明——apply 用 ctx.slots 必须声明）")
+          }
+          if (!/register\(\{[\s\S]*?name:\s*['"]conversation\.view['"]/.test(clientSrc)) {
+            problems.push("slots.register 缺 name: 'conversation.view'（= slot 名，缺了报 slot undefined is not declared）")
+          }
+          if (problems.length > 0) {
+            return 'ERROR: client 骨架校验失败（' + pkgName + '）：\n- ' + problems.join('\n- ')
+              + '\n（模板异常——请反馈注入器维护，勿直接使用该骨架）'
+          }
+        }
         auditLog('scaffold', `${pkgName}（${form}）→ ${targetDir}`)
-        return `OK: ${pkgName}（${form} 形态）已生成于 ${targetDir}\n- ${files.length} 个文件\n下一步：dev_build_plugin {"dir": "${targetDir.replace(/\\/g, '/')}"} → dev_inject_plugin {"dir": "${targetDir.replace(/\\/g, '/')}"}`
+        return `OK: ${pkgName}（${form} 形态）已生成于 ${targetDir}\n- ${files.length} 个文件\n- client 骨架校验通过（inject 声明 + register name）\n下一步：dev_build_plugin {"dir": "${targetDir.replace(/\\/g, '/')}"} → dev_inject_plugin {"dir": "${targetDir.replace(/\\/g, '/')}"}`
       } catch (e) {
         return 'ERROR: 生成失败: ' + String(e)
       }
