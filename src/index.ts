@@ -225,6 +225,19 @@ export function apply(ctx: AppContext, config: Config): void {
     return false
   }
 
+  // ═══ 故障审计（消除不确定性）：自重载失败/自愈尝试全程落盘 self-heal.log。
+  // 教训（实测）：失败只写 logger（harness 终端不可见），恢复后 agent 只能靠
+  // 工具在不在猜测根因——多轮试错。落盘后：恢复即查日志，根因可复盘。
+  const selfHealLogFile = join(dirname(registryFile), 'self-heal.log')
+
+  /** 追加一行故障审计（时间 + 事件 + 详情）。 */
+  function auditLog(event: string, detail: string): void {
+    try {
+      mkdirSync(dirname(selfHealLogFile), { recursive: true })
+      appendFileSync(selfHealLogFile, `[${new Date().toISOString()}] ${event}: ${detail}\n`)
+    } catch { /* 审计写失败不阻塞 */ }
+  }
+
   async function reloadPackage(match: string, urlMatch?: string): Promise<string> {
     const internal = ctx.loader.internal
     if (!internal) return 'ERROR: loader.internal 不可用'
@@ -258,6 +271,7 @@ export function apply(ctx: AppContext, config: Config): void {
       }
       selfReloading = true
       writeSelfReloadState(Date.now())
+      auditLog('self-reload', `自重载触发（match=${match}），自杀并排程重启器`)
       const selfEntry = findEntry(match)
       try {
         if (selfEntry?.fiber && typeof selfEntry.fiber.dispose === 'function') {
@@ -287,6 +301,7 @@ export function apply(ctx: AppContext, config: Config): void {
           } catch (error) {
             logger.error('[super-injector] 重启器重建失败: %s', String(error))
             console.error('[super-injector] 重启器重建失败:', error)
+            auditLog('reboot-failed', String(error))
             // ═══ 失败自愈（实测保障）：垃圾缓存/文件损坏/异步堵塞导致重建失败时，
             // 注入器已缺席——自动重试装配（3 次，间隔 4s/8s/12s）：每次先 purge
             // 毒化缓存（loadCache 残缺 job 会让 loader.create 复用失败态），再
@@ -312,10 +327,14 @@ export function apply(ctx: AppContext, config: Config): void {
                     }
                     await rebootCtx.loader.create({ name: pkgName, config: cfg })
                     logger.info('[super-injector] 自愈：第 %d 次 loader.create 重新装配完成（%s）', attempt, pkgName)
+                    opStats.selfHeal.ok += 1
+                    auditLog(`heal-ok`, `第 ${attempt} 次 loader.create 重新装配成功（${pkgName}）`)
                   } catch (e) {
                     logger.error('[super-injector] 自愈第 %d 次失败: %s', attempt, String(e))
+                    opStats.selfHeal.fail += 1
+                    auditLog(`heal-failed`, `第 ${attempt} 次失败: ${String(e)}`)
                     if (attempt < 3) globalThis.setTimeout(heal, 4000)
-                    else logger.error('[super-injector] 自愈 3 次均失败（需人工介入：修复产物后 touch profile patch 触发重装配）')
+                    else auditLog('heal-exhausted', '3 次均失败（需人工介入：修复产物后 touch profile patch 触发重装配）')
                   }
                 })()
               }
@@ -949,6 +968,19 @@ export function apply(ctx: AppContext, config: Config): void {
     reload: { ok: 0, fail: 0 },
     uninject: { ok: 0, fail: 0 },
     install: { ok: 0, fail: 0 },
+    selfHeal: { ok: 0, fail: 0 },
+  }
+
+  /** 审计摘要：最近 3 条故障/自愈事件（读 self-heal.log 尾部）。 */
+  function auditSummary(): string {
+    try {
+      if (!existsSync(selfHealLogFile)) return ''
+      const lines = readFileSync(selfHealLogFile, 'utf8').trim().split('\n').filter(Boolean)
+      if (lines.length === 0) return ''
+      return '\n===== 故障审计（self-heal.log 尾部 3 条）=====\n' + lines.slice(-3).join('\n')
+    } catch {
+      return ''
+    }
   }
 
   /** 验证 client 模块注册状态（host 侧已完成后的第二验证面）。 */
@@ -1324,7 +1356,7 @@ export function apply(ctx: AppContext, config: Config): void {
       const summary = Object.entries(opStats)
         .map(([k, v]) => `${k} ${v.ok}✓/${v.fail}✗`)
         .join(' | ')
-      return `===== 操作统计（本次运行期）=====\n${summary}\n\n===== 当前已装配插件（loader entries）=====\n` + listPlugins()
+      return `===== 操作统计（本次运行期）=====\n${summary}${auditSummary()}\n\n===== 当前已装配插件（loader entries）=====\n` + listPlugins()
     },
   }))
 
