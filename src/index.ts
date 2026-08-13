@@ -238,6 +238,82 @@ export function apply(ctx: AppContext, config: Config): void {
     } catch { /* 审计写失败不阻塞 */ }
   }
 
+  /**
+   * ═══ 失败自愈（实测保障 + 官方路径优先）：注入器已缺席时自动重试装配
+   * （3 次，间隔 4s/8s/12s）。路径选择（实测教训）：loader.create 会新建
+   * **幽灵 entry**，与官方 bundles entry 并存时 loader 对账防双实例会把官方
+   * entry 标 disabled——所以自愈**优先走官方装配**（touch profile patch →
+   * include.refresh 重装 bundles，无幽灵）；touch 无效才 fallback
+   * loader.create（保底复活）。触发方：重启器 catch（reboot-failed）与
+   * 看门狗（watchdog-timeout——reboot 异步挂起时 catch 不会执行）。
+   */
+  function scheduleHeal(selfEntry: any, reason: string): void {
+    try {
+      const rebootCtx = (selfEntry?.ctx ?? ctx.root) as any
+      const pkgName = selfEntry?.options?.name ?? '@dsh-external/dsh-super-injector'
+      const cfg = selfEntry?.options?.config ?? {}
+      const patchFile = join(dirname(profileNodeModules), 'cordis.patch.yml')
+      let attempt = 0
+      const heal = (): void => {
+        attempt += 1
+        void (async () => {
+          try {
+            // 第一步：touch profile patch 触发官方重装配（不产生幽灵 entry）
+            if (attempt <= 3) {
+              try {
+                mkdirSync(dirname(patchFile), { recursive: true })
+                appendFileSync(patchFile, `\n# super-injector heal ${Date.now()}\n`)
+                // 给 include.refresh 一个窗口，然后验证官方 entry 是否复活
+                await new Promise((r) => globalThis.setTimeout(r, 3000))
+                let officialAlive = false
+                try {
+                  for (const entry of rebootCtx.loader.entries()) {
+                    const o = entry.options
+                    if (o.group) continue
+                    if (String(o.name).includes('dsh-super-injector') && entry.fiber && FIBER_NAMES[entry.fiber.state] === 'active') {
+                      officialAlive = true
+                    }
+                  }
+                } catch { /* 枚举失败按未复活处理 */ }
+                if (officialAlive) {
+                  logger.info('[super-injector] 自愈：第 %d 次 touch patch 官方重装配生效（%s）', attempt, pkgName)
+                  opStats.selfHeal.ok += 1
+                  auditLog('heal-ok', `第 ${attempt} 次 touch patch 官方重装配成功（${pkgName}，触发=${reason}）`)
+                  return
+                }
+                throw new Error('touch patch 后官方 entry 未复活')
+              } catch (e) {
+                // touch 无效 → 降级 loader.create（保底，会留幽灵 entry）
+                const lc = rebootCtx.loader.internal?.loadCache as Map<string, unknown> | undefined
+                if (lc && typeof lc.delete === 'function') {
+                  for (const u of [...lc.keys()]) {
+                    if (typeof u === 'string' && decodeURIComponent(u).includes(pkgName)) {
+                      Map.prototype.delete.call(lc, u)
+                    }
+                  }
+                }
+                await rebootCtx.loader.create({ name: pkgName, config: cfg })
+                logger.info('[super-injector] 自愈：第 %d 次 fallback loader.create 重新装配完成（%s）', attempt, pkgName)
+                opStats.selfHeal.ok += 1
+                auditLog('heal-ok', `第 ${attempt} 次 fallback loader.create 重新装配成功（${pkgName}，触发=${reason}）`)
+              }
+            }
+          } catch (e) {
+            logger.error('[super-injector] 自愈第 %d 次失败: %s', attempt, String(e))
+            opStats.selfHeal.fail += 1
+            auditLog(`heal-failed`, `第 ${attempt} 次失败: ${String(e)}（触发=${reason}）`)
+            if (attempt < 3) globalThis.setTimeout(heal, 4000)
+            else auditLog('heal-exhausted', '3 次均失败（需人工介入：修复产物后 touch profile patch 触发重装配）')
+          }
+        })()
+      }
+      globalThis.setTimeout(heal, 4000)
+      logger.warn('[super-injector] 自愈已排程（4s 后第 1 次：touch patch 官方装配，最多 3 次，触发=%s）', reason)
+    } catch (e) {
+      logger.error('[super-injector] 自愈排程失败: %s', String(e))
+    }
+  }
+
   async function reloadPackage(match: string, urlMatch?: string): Promise<string> {
     const internal = ctx.loader.internal
     if (!internal) return 'ERROR: loader.internal 不可用'
@@ -273,6 +349,30 @@ export function apply(ctx: AppContext, config: Config): void {
       writeSelfReloadState(Date.now())
       auditLog('self-reload', `自重载触发（match=${match}），自杀并排程重启器`)
       const selfEntry = findEntry(match)
+
+      // ═══ 稳定性增强①：预检后自杀 ═══
+      // 自杀前先验证新代码可加载且导出是有效插件——文件损坏/语法错误/导出
+      // 缺失在自杀前被拦截（拒绝自杀，旧代码继续跑），从源头消灭「自杀后
+      // 发现代码坏」的自毁场景（之前实测踩过：lib 损坏 → 自杀 → 重建失败）。
+      // ⚠️ 必须先 purge 再 import：loader.import 命中 loadCache 会返回**旧
+      // 模块**（不重读磁盘）——缓存里的好代码会让预检形同虚设（实测踩坑：
+      // 破坏文件后预检通过、reboot 重读才失败）。purge 后 import 读到磁盘
+      // 新文件，预检才真实。
+      for (const u of urls) Map.prototype.delete.call(loadCache, u)
+      try {
+        const probeNs = await ctx.loader.import(entryUrl, () => [])
+        const probe = ctx.loader.unwrapExports(probeNs)
+        const valid = probe && (typeof probe === 'function' || typeof probe.apply === 'function')
+        if (!valid) {
+          selfReloading = false
+          return 'ERROR: 自重载预检失败——新代码导出非有效插件（缺 apply），已拒绝自杀（旧代码继续运行）'
+        }
+      } catch (e) {
+        selfReloading = false
+        auditLog('precheck-failed', String(e))
+        return `ERROR: 自重载预检失败——新代码无法加载（${String(e).slice(0, 200)}），已拒绝自杀（旧代码继续运行）`
+      }
+
       try {
         if (selfEntry?.fiber && typeof selfEntry.fiber.dispose === 'function') {
           // ⚠️ 根修（实测）：loader 的 internal/plugin 监听（emitPluginDisposed
@@ -290,6 +390,19 @@ export function apply(ctx: AppContext, config: Config): void {
         }
         for (const u of urls) Map.prototype.delete.call(loadCache, u)
       } catch { /* 清理失败不阻塞 */ }
+      // ═══ 稳定性增强②：看门狗 ═══
+      // 自杀后 5 秒检查重建是否完成；若 reboot 挂起（import 永不 resolve/
+      // reject 的异步堵塞）→ catch 不会触发 → 注入器永久缺席。看门狗主动
+      // 发现并触发自愈（touch patch 官方装配优先 + fallback loader.create）。
+      globalThis.setTimeout(() => {
+        try {
+          const cur = selfEntry?.fiber
+          if (!cur || FIBER_NAMES[cur.state] !== 'active') {
+            auditLog('watchdog', '重启器 5s 未完成重建（疑似异步挂起），触发自愈')
+            scheduleHeal(selfEntry, 'watchdog-timeout')
+          }
+        } catch { /* 看门狗失败静默 */ }
+      }, 5000)
       // 全局定时器（globalThis.setTimeout，非 fiber 的 ctx.setTimeout）
       const planned = globalThis.setTimeout(() => {
         void (async () => {
@@ -326,77 +439,8 @@ export function apply(ctx: AppContext, config: Config): void {
             logger.error('[super-injector] 重启器重建失败: %s', String(error))
             console.error('[super-injector] 重启器重建失败:', error)
             auditLog('reboot-failed', String(error))
-            // ═══ 失败自愈（实测保障 + 官方路径优先）：垃圾缓存/文件损坏/异步
-            // 堵塞导致重建失败时，注入器已缺席——自动重试（3 次，间隔 4s/8s/12s）。
-            // ⚠️ 路径选择（实测教训）：loader.create 会新建**幽灵 entry**，与官方
-            // bundles entry 并存时 loader 对账防双实例会把官方 entry 标 disabled
-            // （官方清单里注入器变 disabled、实际跑在幽灵上——上次实测踩坑）。
-            // 所以自愈**优先走官方装配**：touch profile patch → loader 监听 →
-            // include.refresh 重装 bundles（官方 entry，无幽灵）；touch 无效时
-            // 才 fallback loader.create（保底复活，后续可清理幽灵）。
-            try {
-              const rebootCtx = (selfEntry?.ctx ?? ctx.root) as any
-              const pkgName = selfEntry?.options?.name ?? '@dsh-external/dsh-super-injector'
-              const patchFile = join(dirname(profileNodeModules), 'cordis.patch.yml')
-              let attempt = 0
-              const heal = (): void => {
-                attempt += 1
-                void (async () => {
-                  try {
-                    // 第一步：touch profile patch 触发官方重装配（不产生幽灵 entry）
-                    if (attempt <= 3) {
-                      try {
-                        mkdirSync(dirname(patchFile), { recursive: true })
-                        appendFileSync(patchFile, `\n# super-injector heal ${Date.now()}\n`)
-                        // 给 include.refresh 一个窗口，然后验证官方 entry 是否复活
-                        await new Promise((r) => globalThis.setTimeout(r, 3000))
-                        let officialAlive = false
-                        try {
-                          for (const entry of rebootCtx.loader.entries()) {
-                            const o = entry.options
-                            if (o.group) continue
-                            if (String(o.name).includes('dsh-super-injector') && entry.fiber && FIBER_NAMES[entry.fiber.state] === 'active') {
-                              officialAlive = true
-                            }
-                          }
-                        } catch { /* 枚举失败按未复活处理 */ }
-                        if (officialAlive) {
-                          logger.info('[super-injector] 自愈：第 %d 次 touch patch 官方重装配生效（%s）', attempt, pkgName)
-                          opStats.selfHeal.ok += 1
-                          auditLog('heal-ok', `第 ${attempt} 次 touch patch 官方重装配成功（${pkgName}）`)
-                          return
-                        }
-                        throw new Error('touch patch 后官方 entry 未复活')
-                      } catch (e) {
-                        // touch 无效 → 降级 loader.create（保底，会留幽灵 entry）
-                        const lc = rebootCtx.loader.internal?.loadCache as Map<string, unknown> | undefined
-                        if (lc && typeof lc.delete === 'function') {
-                          for (const u of [...lc.keys()]) {
-                            if (typeof u === 'string' && decodeURIComponent(u).includes(pkgName)) {
-                              Map.prototype.delete.call(lc, u)
-                            }
-                          }
-                        }
-                        await rebootCtx.loader.create({ name: pkgName, config: selfEntry?.options?.config ?? {} })
-                        logger.info('[super-injector] 自愈：第 %d 次 fallback loader.create 重新装配完成（%s）', attempt, pkgName)
-                        opStats.selfHeal.ok += 1
-                        auditLog('heal-ok', `第 ${attempt} 次 fallback loader.create 重新装配成功（${pkgName}）`)
-                      }
-                    }
-                  } catch (e) {
-                    logger.error('[super-injector] 自愈第 %d 次失败: %s', attempt, String(e))
-                    opStats.selfHeal.fail += 1
-                    auditLog(`heal-failed`, `第 ${attempt} 次失败: ${String(e)}`)
-                    if (attempt < 3) globalThis.setTimeout(heal, 4000)
-                    else auditLog('heal-exhausted', '3 次均失败（需人工介入：修复产物后 touch profile patch 触发重装配）')
-                  }
-                })()
-              }
-              globalThis.setTimeout(heal, 4000)
-              logger.warn('[super-injector] 自愈已排程（4s 后第 1 次：touch patch 官方装配，最多 3 次）')
-            } catch (e) {
-              logger.error('[super-injector] 自愈排程失败: %s', String(e))
-            }
+            // 失败自愈（抽成 scheduleHeal，与看门狗共用）
+            scheduleHeal(selfEntry, 'reboot-failed')
           } finally {
             // 防自毁③：无论成败都释放窗口锁（失败时注入器已缺席，锁必须
             // 释放以便后续手动/自动恢复路径可重新装配）
@@ -1509,7 +1553,15 @@ export function apply(ctx: AppContext, config: Config): void {
   ctx.systemPrompt.context({
     name: 'dsh-super-injector',
     order: -90,
-    text: 'dev_inject_plugin 等 dev_* 工具属于 dsh-super-injector（插件热插拔 + 自主迭代）。若它无法实现此目的，优先修复注入器。',
+    // 引导（首次接触的 agent 从这段获得完整认知）：
+    // 1) dev_* 工具 = dsh-super-injector（运行时注入通道）；
+    // 2) 插件形态无上限：工具包 / 守护循环（timer+LLM 自主 agent loop）/
+    //    UI 面板 / 混合形态，同一通道——注入即完整生效（host+UI）、可热
+    //    重载与自重载、卸载即净；
+    // 3) 插件自身的提示词/工具/循环皆可自我优化（改→build→重载闭环）；
+    // 4) 使命：若注入器无法支撑此闭环，优先修复注入器。
+    // ⚠️ 静态常量文本（缓存原则：静态到头）——严禁动态拼接。
+    text: '本环境装有 dsh-super-injector（dev_* 工具）：任意本地插件包可运行时注入——工具包/守护循环（timer+LLM 自主 agent loop）/UI 面板/混合形态，同一通道；注入即完整生效（host+UI）、可热重载与自重载、卸载即净。插件自身的提示词/工具/循环皆可自我优化。若注入器无法支撑此闭环，优先修复注入器。',
   })
 
   logger.info('[super-injector] 就绪：watch %d 目录（%dms），autoRestore=%s', watches.length, intervalMs, String(config.autoRestore))
