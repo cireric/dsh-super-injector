@@ -1600,8 +1600,19 @@ export function apply(ctx: AppContext, config: Config): void {
     }
   }
 
-  /** 验证 client 模块注册状态（host 侧已完成后的第二验证面）。 */
+  /** 验证 client 模块注册状态（host 侧已完成后的第二验证面）。
+   * 区分「无 client 声明（预期跳过）」与「有声明但注册失败（真 ✗）」。 */
   function clientStatus(name: string): string {
+    // 1. 读包 package.json 判断是否有 client 声明（从 junction 路径）
+    let declared = false
+    try {
+      const parts = name.startsWith('@') ? name.split('/') : [name]
+      const pkgFile = join(profileNodeModules, ...parts, 'package.json')
+      const pkg = JSON.parse(readFileSync(pkgFile, 'utf8')) as { dsh?: { client?: { platform?: string } } }
+      declared = !!(pkg.dsh?.client && pkg.dsh.client.platform === 'web')
+    } catch { /* 读不到按无声明处理 */ }
+    if (!declared) return 'client 跳过（无 client 声明，属预期）'
+    // 2. 有声明 → 查注册表
     try {
       const cm = ctx.get('clientModules') as {
         clientPath?: (id: string) => string | undefined
@@ -1619,7 +1630,7 @@ export function apply(ctx: AppContext, config: Config): void {
           }
         }
       }
-      return path ? `client ✓ (${path.split(/[\\/]/).slice(-2).join('/')})` : 'client ✗（未注册——插件无 client 声明或注册失败）'
+      return path ? `client ✓ (${path.split(/[\\/]/).slice(-2).join('/')})` : `client ✗（已声明 client 但注册失败——检查 client bundle 是否构建（build:client）与 entry 状态）`
     } catch {
       return 'client 状态未知'
     }
@@ -2524,10 +2535,14 @@ export function apply(ctx: AppContext, config: Config): void {
     },
   }))
 
-  /** 汇总 PASS/FAIL。 */
+  /** 汇总 PASS/FAIL（PASS 项的预期拒绝场景（ERROR: 前缀）显示为 [EXPECTED]）。 */
   function summarize(results: Array<[string, boolean, string]>): string {
     const pass = results.filter(([, ok]) => ok).length
-    const lines = results.map(([n, ok, d]) => `- [${ok ? 'PASS' : 'FAIL'}] ${n}${d ? ' — ' + d.slice(0, 400) : ''}`)
+    const lines = results.map(([n, ok, d]) => {
+      let detail = d ? d.slice(0, 400) : ''
+      if (ok && detail.startsWith('ERROR:')) detail = '[EXPECTED]' + detail.slice(6)
+      return `- [${ok ? 'PASS' : 'FAIL'}] ${n}${detail ? ' — ' + detail : ''}`
+    })
     auditLog('self-test', `PASS ${pass}/${results.length}`)
     return `===== 注入器自检（PASS ${pass}/${results.length}）=====\n` + lines.join('\n')
   }
@@ -2551,7 +2566,7 @@ export function apply(ctx: AppContext, config: Config): void {
     //    仓库、已注入插件、官方 packages 的服务面与构建模式），不重复造轮子；
     // 5) 使命：若注入器无法支撑此闭环，优先修复注入器。
     // ⚠️ 静态常量文本（缓存原则：静态到头）——严禁动态拼接。
-    text: '本环境装有 dsh-super-injector（dev_* 工具）：任意本地插件包可运行时注入——工具包/守护循环（timer+LLM 自主 agent loop）/UI 面板/混合形态，同一通道；注入即完整生效（host+UI）、可热重载与自重载、卸载即净。插件自身的提示词/工具/循环皆可自我优化；建新插件优先克隆/借鉴/重构生态已有资源（dsh-external 仓库、已注入插件、官方 packages 模式），不重复造轮子。若注入器无法支撑此闭环，优先修复注入器。',
+    text: '本环境装有 dsh-super-injector（dev_* 工具）：任意本地插件包可运行时注入——工具包/守护循环（timer+LLM 自主 agent loop）/UI 面板/混合形态，同一通道；注入即完整生效（host+UI）、可热重载与自重载、卸载即净。插件自身的提示词/工具/循环皆可自我优化；建新插件优先克隆/借鉴/重构生态已有资源（dsh-external 仓库、已注入插件、官方 packages 模式），不重复造轮子。若注入器无法支撑此闭环，优先修复注入器。从零体验路径：dev_plugin_status → dev_self_test → dev_scaffold_plugin → dev_build_plugin → dev_inject_plugin → dev_uninject_plugin。',
   })
 
   logger.info('[super-injector] 就绪：watch %d 目录（%dms），autoRestore=%s', watches.length, intervalMs, String(config.autoRestore))
