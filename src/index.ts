@@ -709,7 +709,9 @@ export function apply(ctx: AppContext, config: Config): void {
    */
   function scheduleHeal(selfEntry: any, reason: string): void {
     try {
-      const rebootCtx = (selfEntry?.ctx ?? ctx.root) as any
+      // ⚠️ rebootCtx 用 ctx.root（loader 树根，恒活跃）：selfEntry.ctx 在自毁后
+      // inactive（实测：cloud-restore 版自重载自杀后 rebuild 报 inactive context）
+      const rebootCtx = ctx.root as any
       const pkgName = selfEntry?.options?.name ?? '@dsh-external/dsh-super-injector'
       const cfg = selfEntry?.options?.config ?? {}
       const patchFile = join(dirname(profileNodeModules), 'cordis.patch.yml')
@@ -823,6 +825,11 @@ export function apply(ctx: AppContext, config: Config): void {
       } catch { /* 降级失败继续走下面判断 */ }
       if (entryUrl) {
         auditLog('cache-miss-healed', `缓存无匹配已降级从磁盘加载（${urlKey} → ${entryUrl}）`)
+        // ⚠️ 关键（实测踩坑）：降级路径下外层 urls 仍为空——后续预检的
+        // purge（for u of urls delete）不生效 → import 命中旧模块 → 预检
+        // 误通过 → 真自杀。把降级得到的 key 补进 urls，预检才能 purge 后
+        // 重读磁盘（文件损坏时正确拦截）。
+        urls = [entryUrl]
       }
     } else {
       entryUrl = urls.find(u => u.endsWith('/lib/index.js'))
@@ -927,12 +934,12 @@ export function apply(ctx: AppContext, config: Config): void {
       const planned = globalThis.setTimeout(() => {
         void (async () => {
           try {
-            // ⚠️ 服务访问必须走 entry 的 ctx（rebootCtx）：注入器已自杀，
-            // 自身 ctx inactive——用注入器 ctx 调 ctx.loader.import() 会抛
-            // 「cannot get required service "loader" in inactive context」
-            // （实测两次自重载失败的根因）。rebootCtx 原型链继承 loader
-            // 的活跃 fiber，服务解析正常，与 loader._start 装配路径一致。
-            const rebootCtx = (selfEntry?.ctx ?? ctx.root) as any
+            // ⚠️ 服务访问必须走 loader 树根 ctx（rebootCtx = ctx.root，恒活跃）：
+            // 注入器已自杀后 selfEntry.ctx 会 inactive——用它调 ctx.loader.import()
+            // 会抛「cannot get required service "loader" in inactive context」
+            // （实测：cloud-restore 版自重载自杀后 rebuild 失败的根因）。ctx.root
+            // 原型链继承 loader 的活跃 fiber，服务解析正常。
+            const rebootCtx = ctx.root as any
             const fresh = rebootCtx.loader.unwrapExports(await rebootCtx.loader.import(entryUrlFinal, () => []))
             if (selfEntry) {
               // registry.plugin() 断言当前 fiber 存活：rebootCtx.fiber 指向
@@ -2524,6 +2531,9 @@ export function apply(ctx: AppContext, config: Config): void {
         check('测试插件构建', br !== null && br.code === 0 && libBuilt, br && br.code !== 0 ? br.output.slice(-300) : (libBuilt ? '' : 'lib/index.js 未生成'))
         if (!br || br.code !== 0 || !libBuilt) return summarize(results)
         // ── 3. 注入 → host ✓ ──
+        // ⚠️ 先清理上次自检可能的残留（整体 FAIL 中断时 finally 不一定跑完——
+        // 实测：注入报「已激活运行」因为残留 entry 没卸载）
+        try { await uninject(TEST_SHORT) } catch { /* 忽略 */ }
         const inj = await inject(tmpDir)
         if (inj.includes('host ✓')) {
           check('注入（host ✓）', true, inj)
@@ -2554,10 +2564,31 @@ export function apply(ctx: AppContext, config: Config): void {
         const throttle = await withOpLock(() => reloadPackage('dsh-super-injector'))
         check('自重载节流（<10s 拒绝）', throttle.includes('节流'), throttle.slice(0, 100))
         writeSelfReloadState(0)
-        // ── 6. 预检拦截（临时破坏注入器 lib → 拒绝自杀 → 恢复）──
-        const selfLib = join(homedir(), 'dsh', 'dsh-super-injector', 'lib', 'index.js')
-        const selfLibAlt = 'D:/杨佳禾/dsh/dsh-super-injector/lib/index.js'
-        const libPath = existsSync(selfLib) ? selfLib : (existsSync(selfLibAlt) ? selfLibAlt : '')
+        // ── 6. 预检拦截（临时破坏**实际运行**的注入器 lib → 拒绝自杀 → 恢复）──
+        // ⚠️ 通用定位（实测踩坑×2）：①注入器可能运行于副本目录（cloud-restore
+        // 等）——破坏本地工作区 lib 不会让预检拦截；②loadCache key 是 realpath
+        // （不含包名）——按包名扫不到。可靠方案：junction 的 realpath（junction
+        // 由安装建立、始终指向实际运行文件）。
+        let libPath = ''
+        try {
+          const juncLib = join(profileNodeModules, '@dsh-external', 'dsh-super-injector', 'lib', 'index.js')
+          if (existsSync(juncLib)) {
+            const real = realpathSync(juncLib)
+            if (existsSync(real)) libPath = real
+          }
+          if (!libPath) {
+            // fallback：loadCache 扫描（含包名或 cloud-restore 特征）
+            const lcT = ctx.loader.internal?.loadCache as Map<string, unknown> | undefined
+            for (const u of lcT?.keys() ?? []) {
+              if (typeof u !== 'string' || !u.endsWith('/lib/index.js')) continue
+              const d = decodeURIComponent(u)
+              if (!d.includes('dsh-super-injector') && !d.includes('cloud-restore')) continue
+              let fp = d.replace(/^file:\/\//, '')
+              if (fp.startsWith('/')) fp = fp.slice(1)
+              if (existsSync(fp)) { libPath = fp; break }
+            }
+          }
+        } catch { /* 定位失败按无处理 */ }
         if (libPath) {
           let libRestored = true
           try {
