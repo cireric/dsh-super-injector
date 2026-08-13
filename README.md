@@ -110,6 +110,63 @@ dsh plugin --profile web add github:dsh-external/dsh-super-injector
 | `dev_stage_promote` | 一键转正：侧挂工具挂前侧正式注册（唯一一次缓存刷新） |
 | `dev_stage_demote` | 撤回/注销侧挂或已转正工具 |
 
+## 插件开发指南（生产线）
+
+**哲学**：插件想长成什么样就能长成什么样——工具包 / 守护循环（timer+LLM 自主 agent loop）/ UI 面板 / 混合形态，同一注入通道；注入即完整生效（host+UI）、可热重载与自重载、卸载即净；**插件自身的提示词/工具/循环皆可自我优化**（改 → build → 重载闭环）。建新插件**优先克隆/借鉴/重构生态已有资源**（dsh-external 仓库、已注入插件、官方 packages 模式），不重复造轮子。
+
+### 一分钟起步（生产线三件套）
+
+```bash
+# 1. 生成骨架（toolkit / daemon-loop / ui-panel / hybrid）
+#    对 AI 说：dev_scaffold_plugin {"dir": "D:/dev/my-plugin", "name": "my-plugin", "form": "daemon-loop", "description": "..."}
+
+# 2. 构建打包（探测 DSH_CHECKOUT → tsc host → tsdown client（如声明）→ npm pack → tgz）
+#    对 AI 说：dev_build_plugin {"dir": "D:/dev/my-plugin"}
+
+# 3. 发布（gh release create v<version> + tgz）
+#    对 AI 说：dev_release_plugin {"dir": "D:/dev/my-plugin", "version": "0.1.0"}
+
+# 注入即活：dev_inject_plugin {"dir": "D:/dev/my-plugin"}
+# 改代码 → build → 自动 watch ~1.5s 重载（或 dev_reload_package）
+```
+
+### 30 行写一个"会思考的插件"（守护循环最小示例）
+
+```ts
+import type { Context } from 'cordis'
+import type LlmService from '@deepseek-ai/dsh-llm'
+import { createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm'
+
+type AppContext = Context & { llm: LlmService; setInterval(fn: () => void, ms: number): any }
+
+export const name = 'my-daemon'
+export const inject = ['timer', 'llm']
+
+export function apply(ctx: AppContext): void {
+  let route: { provider: string; model: string } | null = null
+  ctx.on('llm/stream', (options, next) => { route = { provider: options.provider, model: options.model }; return next() })
+  ctx.setInterval(() => {
+    void (async () => {
+      if (!route) return
+      const stream = ctx.llm.stream({
+        provider: route.provider, model: route.model,
+        system: '判断是否需要人工介入，直接输出结论',
+        messages: [createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: '检查事项...' }] })],
+        reasoningEffort: ReasoningEffortId('off'), maxTokens: 200,
+      })
+      for await (const chunk of stream) { /* 决策 → 行动 */ }
+    })().catch(() => {})
+  }, 60_000)
+}
+```
+
+**规范铁律**（注入器实测沉淀）：
+1. **资源注册必须挂 `ctx.effect`**（工具/路由/监听）——热重载/卸载才能自动清理，否则僵尸残留（注入器自己踩过）
+2. **peerDependencies 用范围声明**（`>=0.0.1-rc <2`、`>=4.0.0-rc <5`）——不硬编码版本，DSH 升级不报废
+3. **client bundle 需单独构建**（tsdown → lib/client.js）——UI 形态两步构建
+4. **提示词注入遵守缓存原则**：静态文本 + order 靠前（静态到头）；动态内容走消息尾（动态到尾）；严禁动态拼接进 system
+5. **自检**：改完代码跑一次 `dev_self_test`，确保注入/重载/自重载/预检/卸载全链路不退化
+
 ## 典型工作流
 
 **装模组**：拿到插件包（package.json + lib/ 产物）→ 对 AI 说 `dev_inject_plugin`（参数 = 插件包绝对路径）→ 当场生效（下一 step 工具可见）。
