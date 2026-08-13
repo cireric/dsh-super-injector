@@ -11,7 +11,8 @@
  *  4. dev_plugin_status     — 已装配插件清单（id/name/fiber 状态/入口）
  *  5. dev_injected_list     — 注入清单（registry.json，重启自动恢复）
  *  6. 自动轮询 watch        — lib 产物指纹变化 → 自动热重载
- *  7. 智能能力提示注入       — 新会话首轮完整版 / 关键词命中简版 / 其余零注入
+ *  7. 静态能力提示注入       — 固定文本 + order 靠前（静态到头：工具 schema
+ *     变更时静态段仍缓存命中；动态内容才走尾部/消息尾）
  *
  * 关键机制（全部实测验证）：
  *  - loadCache key 是 realpath URL（file:///F:/...，匹配用目录名子串）；
@@ -34,13 +35,13 @@ type AppContext = Context & {
   loader: Loader
   tools: ToolRegistry
   systemPrompt: SystemPrompt
-  httpServer: any
+  webServer: any
   registry: any
   setInterval(fn: () => void, ms: number): any
 }
 
 export const name = 'dsh-super-injector'
-export const inject = ['loader', 'timer', 'tools', 'systemPrompt', 'httpServer']
+export const inject = ['loader', 'timer', 'tools', 'systemPrompt', 'webServer']
 
 export interface Config {
   /** 注入清单文件路径（缺省 ~/.dsh/super-injector/registry.json）。 */
@@ -151,14 +152,16 @@ export function apply(ctx: AppContext, config: Config): void {
     if (!loadCache || typeof loadCache.delete !== 'function') return
     const key = pkgDir.replace(/\\/g, '/')
     for (const u of [...loadCache.keys()]) {
-      if (typeof u === 'string' && u.includes(key)) Map.prototype.delete.call(loadCache, u)
+      // URL 是百分号编码的（非 ASCII 目录），先解码再匹配
+      const uDecoded = decodeURIComponent(u)
+      if (uDecoded.includes(key)) Map.prototype.delete.call(loadCache, u)
     }
   }
 
   // ============ 热重载核心 ============
   /** 按包名匹配清理 webserver 路由残留（强制登记守卫的自愈部分）。 */
   function clearRoutesByMatch(match: string): string[] {
-    const hs = ctx.httpServer
+    const hs = ctx.webServer
     const cleaned: string[] = []
     for (const tableName of ['exact', 'prefixes', 'upgrades'] as const) {
       const table = hs?.[tableName]
@@ -173,14 +176,23 @@ export function apply(ctx: AppContext, config: Config): void {
     return cleaned
   }
 
-  /** 整包热重载：清缓存 → import → 重建 fiber，失败回滚保留旧代。 */
-  async function reloadPackage(match: string): Promise<string> {
+  /**
+   * 整包热重载：清缓存 → import → 重建 fiber，失败回滚保留旧代。
+   * @param match - entry 匹配子串（id/name；同时用于 URL 匹配，除非给 urlMatch）
+   * @param urlMatch - URL 匹配子串（watch 自动重载传目录路径；loadCache key 是
+   *   百分号编码的 file URL，包名不是 URL 子串，必须用目录路径匹配）
+   */
+  async function reloadPackage(match: string, urlMatch?: string): Promise<string> {
     const internal = ctx.loader.internal
     if (!internal) return 'ERROR: loader.internal 不可用'
     const loadCache = internal.loadCache as Map<string, any>
 
-    const urls = [...loadCache.keys()].filter(u => typeof u === 'string' && u.includes(match))
-    if (!urls.length) return `INFO: 缓存中无匹配 "${match}" 的模块`
+    const urlKey = (urlMatch ?? match).replace(/\\/g, '/')
+    const urls = [...loadCache.keys()].filter((u) => {
+      if (typeof u !== 'string') return false
+      return decodeURIComponent(u).includes(urlKey)
+    })
+    if (!urls.length) return `INFO: 缓存中无匹配 "${urlKey}" 的模块`
     const entryUrl = urls.find(u => u.endsWith('/lib/index.js'))
     if (!entryUrl) return `ERROR: 未找到入口 lib/index.js（匹配 ${urls.length} 个模块）`
 
@@ -192,10 +204,7 @@ export function apply(ctx: AppContext, config: Config): void {
     // 定时器延续，直到重建结束。
     const isSelf = String(match).includes('dsh-super-injector')
     if (isSelf) {
-      const selfEntry = [...ctx.loader.entries()].find((en) => {
-        const o = en.options as { name?: string }
-        return o?.name && String(o.name).includes(match)
-      })
+      const selfEntry = findEntry(match)
       try {
         if (selfEntry?.fiber && typeof selfEntry.fiber.dispose === 'function') {
           await selfEntry.fiber.dispose()
@@ -206,15 +215,24 @@ export function apply(ctx: AppContext, config: Config): void {
       const planned = globalThis.setTimeout(() => {
         void (async () => {
           try {
-            const fresh = ctx.loader.unwrapExports(await ctx.loader.import(entryUrl, () => []))
+            // ⚠️ 服务访问必须走 entry 的 ctx（rebootCtx）：注入器已自杀，
+            // 自身 ctx inactive——用注入器 ctx 调 ctx.loader.import() 会抛
+            // 「cannot get required service "loader" in inactive context」
+            // （实测两次自重载失败的根因）。rebootCtx 原型链继承 loader
+            // 的活跃 fiber，服务解析正常，与 loader._start 装配路径一致。
+            const rebootCtx = (selfEntry?.ctx ?? ctx.root) as any
+            const fresh = rebootCtx.loader.unwrapExports(await rebootCtx.loader.import(entryUrl, () => []))
             if (selfEntry) {
-              const nf = ctx.registry.plugin(fresh, selfEntry.options.config ?? {}, () => [])
+              // registry.plugin() 断言当前 fiber 存活：rebootCtx.fiber 指向
+              // loader 的活跃 fiber，assertActive 通过。
+              const nf = rebootCtx.registry.plugin(fresh, selfEntry.options.config ?? {}, () => [])
               nf.entry = selfEntry
               selfEntry.fiber = nf
               logger.info('[super-injector] 重启器重建完成 state=%s', nf.state)
             }
           } catch (error) {
             logger.error('[super-injector] 重启器重建失败: %s', String(error))
+            console.error('[super-injector] 重启器重建失败:', error)
           }
         })()
       }, 100)
@@ -290,6 +308,7 @@ export function apply(ctx: AppContext, config: Config): void {
           const nf2 = ctx.registry.plugin(fresh2, target.options.config ?? {}, () => [])
           nf2.entry = target
           target.fiber = nf2
+          normalizeEntriesByName(match)
           return `OK: registry 无 runtime，entry.fiber 直接重建（state=${nf2.state}）`
         } catch (e) {
           return 'ERROR: entry 重建失败: ' + (e instanceof Error ? e.stack : String(e))
@@ -337,7 +356,11 @@ export function apply(ctx: AppContext, config: Config): void {
     }
 
     // dispose 旧 fiber + 重建（失败 → 尝试用旧插件恢复）
-    const fibers = runtime.fibers as any[]
+    // ⚠️ 快照 fiber 列表：runtime.fibers 是 DisposableList（活引用），
+    // 下方 await 旧 fiber dispose 会把 fiber 从列表移除——若直接遍历活
+    // 列表，重建循环看到的永远是空列表（实测「重建 0 fiber」）。快照
+    // 必须在 dispose 之前完成。
+    const fibers = [...runtime.fibers] as any[]
     const failures: string[] = []
     let rebuilt = 0
     try {
@@ -358,16 +381,27 @@ export function apply(ctx: AppContext, config: Config): void {
         } catch { /* dispose 清理失败不阻塞重建 */ }
       }
       ctx.registry.delete(oldPlugin)
+      const newFibers: any[] = []
       for (const oldFiber of fibers) {
         try {
           const fiber = oldFiber.parent.registry.plugin(fresh, config, () => [])
           fiber.entry = oldFiber.entry
           if (fiber.entry) fiber.entry.fiber = fiber
+          newFibers.push(fiber)
           rebuilt++
         } catch (e) {
           failures.push(String(e))
         }
       }
+      // ⚠️ 等新 fiber 完成初始化（loading → active）：registry.plugin 同步返回的
+      // fiber 还是 pending/loading——若不等，随后的 client 操作（processOne 的
+      // !entry.disabled 检查、activeEntry 查找）会基于不稳定状态失败（实测
+      // reload 报 client ✗ 的根因：activeEntry=none → fullName 回落短名 →
+      // processOne 精确匹配失败；reload 返回后 fiber 才转 active 补注册）。
+      await Promise.allSettled(newFibers.map((f) => {
+        const p = typeof f.await === 'function' ? f.await() : undefined
+        return p ?? Promise.resolve()
+      }))
     } catch (e) {
       // 整体失败：回滚缓存 + 用旧插件重建
       for (const [u, job] of backup) loadCache.set(u, job)
@@ -395,7 +429,40 @@ export function apply(ctx: AppContext, config: Config): void {
     if (failures.length) {
       return `WARN: ${match} 部分重建（${rebuilt}/${fibers.length}）: ${failures.join('; ')}`
     }
-    return `OK: ${match} 热重载完成（清缓存 ${urls.length} 模块，重建 ${rebuilt} fiber）`
+    // 清 disabled（幽灵 entry 隔离）：热重载后 client 模块可重新注册（UI 生效）
+    normalizeEntriesByName(match)
+    // ⚠️ 以下 client 操作必须用**完整包名**：client-modules 的 processOne 对
+    // entry.options.name 做精确匹配（短名 'dsh-engram-relay' ≠ '@dsh-external/...'），
+    // 传短名会静默注册失败（实测 reload 报 client ✗ 的根因——microtask flush
+    // 后来用完整名补注册，但返回信息已经错了）。
+    const activeEntry = [...ctx.loader.entries()].find((en) => {
+      const o = en.options
+      return !o.group && String(o.name).includes(match) && en.fiber && FIBER_NAMES[en.fiber.state] === 'active'
+    })
+    const fullName = activeEntry?.options.name ?? match
+    // ═══ 临时诊断（排查 reload 后 client ✗）：写 reload-debug.log ═══
+    try {
+      const dbg = [
+        `[${new Date().toISOString()}] reload match=${match} fullName=${fullName}`,
+        `  activeEntry=${activeEntry ? activeEntry.id : 'none'} fiberState=${activeEntry?.fiber ? FIBER_NAMES[activeEntry.fiber.state] : '?'} entry.disabled=${activeEntry ? activeEntry.disabled : '?'} options.disabled=${activeEntry ? JSON.stringify(activeEntry.options.disabled) : '?'}`,
+      ]
+      const cmDbg = ctx.get('clientModules') as { clientPath?: (id: string) => string | undefined; table?: Map<string, unknown> } | undefined
+      dbg.push(`  cm=${cmDbg ? 'yes' : 'no'} clientPath(short)=${cmDbg?.clientPath ? String(cmDbg.clientPath(match)) : '?'} clientPath(full)=${cmDbg?.clientPath ? String(cmDbg.clientPath(fullName)) : '?'}`)
+      if (cmDbg?.table) {
+        const keys: string[] = []
+        for (const k of cmDbg.table.keys()) keys.push(String(k))
+        dbg.push(`  table keys(${keys.length}): ${keys.filter((k) => k.includes('engram') || k.includes('dsh-external')).join(',') || '(none)'}`)
+      }
+      appendFileSync(join(homedir(), '.dsh', 'super-injector', 'reload-debug.log'), dbg.join('\n') + '\n')
+    } catch { /* 诊断失败不阻塞 */ }
+    // client 模块补扫（表丢失/从未注册时自愈——web 重启后幽灵 entry 场景）
+    refreshClientRow(fullName)
+    // client bundle 联动：host 重载后 bundle rev 变化通知浏览器（改 UI → 免手动刷新）
+    notifyClientRebuilt(fullName)
+    // 自检：完整包名查表（表 key 是完整包名，完全匹配）
+    const client = clientStatus(fullName)
+    recordOp('reload', rebuilt > 0)
+    return `OK: ${match} 热重载完成（清缓存 ${urls.length} 模块，重建 ${rebuilt} fiber）\n- ${client}`
   }
 
   // ============ 插件状态 ============
@@ -413,14 +480,25 @@ export function apply(ctx: AppContext, config: Config): void {
     return lines.length ? lines.join('\n') : '（loader 中无已装配插件 entry）'
   }
 
-  /** 查找匹配的 entry（id 或 name 子串）。 */
+  /** 查找匹配的 entry（id 或 name 子串）——优先活跃 entry，跳过 disposed/failed/disabled 残留。 */
   function findEntry(match: string): any {
+    const candidates: any[] = []
     for (const entry of ctx.loader.entries()) {
       const opts = entry.options
       if (opts.group) continue
-      if (opts.id.includes(match) || opts.name.includes(match)) return entry
+      if (opts.id.includes(match) || opts.name.includes(match)) candidates.push(entry)
     }
-    return undefined
+    if (candidates.length === 0) return undefined
+    // 活跃优先（唯一在线实例）；无活跃时取第一个非 disposed/failed 的
+    const live = candidates.find((e) => {
+      const st = stateOf(e)
+      return st === 'active'
+    })
+    if (live) return live
+    return candidates.find((e) => {
+      const st = stateOf(e)
+      return st !== 'disposed' && st !== 'failed' && st !== 'no-fiber'
+    }) ?? candidates[0]
   }
 
   // ============ 开发侧挂区（staging）：测试工具挂后侧，转正才进 schema ============
@@ -428,16 +506,83 @@ export function apply(ctx: AppContext, config: Config): void {
   // 开发/审计工具一律挂"后侧"（staging）：不进 schema、缓存零污染，经
   // dev_stage_call 测试；确认转正后 dev_stage_promote 一键挂"前侧"（正式注册，
   // 仅承受这一次缓存刷新）。execute 为 JS 代码字符串（function(args, ctx){...}），
-  // 闭包可访问本插件的 ctx（httpServer/loader/timer/tools/systemPrompt）——仅限可信代码。
+  // 闭包可访问本插件的 ctx（webServer/loader/timer/tools/systemPrompt）——仅限可信代码。
   interface StagedTool {
     description: string
     parameters: Record<string, unknown>
     execute: (args: Record<string, unknown>, c: any) => unknown | Promise<unknown>
+    /** execute 源码字符串（持久化用：自重载/重启后重新编译恢复）。 */
+    source?: string
     promoted: boolean
     /** 转正注册的释放句柄（ctx.effect disposer）——demote 时注销正式工具。 */
     disposer?: () => void
   }
   const staged = new Map<string, StagedTool>()
+
+  // ═══ staging 持久化：自重载（注入器自杀重建）会丢掉 apply 闭包里的 staged
+  // map——promote 过的正式工具会随旧 fiber 注销而消失（实测 bug）。落盘到
+  // staging.json，apply 启动时恢复（execute 源码重新编译 + promoted 重新注册）。
+  const stagingFile = join(dirname(registryFile), 'staging.json')
+
+  function saveStaging(): void {
+    try {
+      const data: Record<string, { description: string; parameters: unknown; source: string; promoted: boolean }> = {}
+      for (const [name, t] of staged) {
+        if (typeof t.source === 'string' && t.source !== '') {
+          data[name] = { description: t.description, parameters: t.parameters, source: t.source, promoted: t.promoted }
+        }
+      }
+      mkdirSync(dirname(stagingFile), { recursive: true })
+      writeFileSync(stagingFile, JSON.stringify(data, null, 2), 'utf8')
+    } catch { /* 持久化失败不阻塞 */ }
+  }
+
+  /** 恢复持久化的 staging（含 promoted 重新转正注册）。 */
+  function restoreStaging(): void {
+    try {
+      if (!existsSync(stagingFile)) return
+      const data = JSON.parse(readFileSync(stagingFile, 'utf8')) as Record<string, { description?: string; parameters?: unknown; source?: string; promoted?: boolean }>
+      for (const [name, raw] of Object.entries(data)) {
+        if (typeof raw.source !== 'string' || raw.source === '') continue
+        if (staged.has(name)) continue
+        let fn: Function
+        try {
+          fn = new Function('args', 'ctx', `return (${raw.source})(args, ctx)`)
+        } catch {
+          continue // 源码损坏：跳过该工具，不拖垮恢复
+        }
+        const tool: StagedTool = {
+          description: String(raw.description ?? ''),
+          parameters: (raw.parameters && typeof raw.parameters === 'object')
+            ? raw.parameters as Record<string, unknown>
+            : {},
+          execute: fn as StagedTool['execute'],
+          source: raw.source,
+          promoted: raw.promoted === true,
+        }
+        staged.set(name, tool)
+        // promoted 工具重新转正注册（ctx.effect：fiber dispose 自动注销）
+        if (tool.promoted) {
+          try {
+            const dispose = ctx.effect(() => ctx.tools.register(defineTool({
+              name,
+              description: tool.description,
+              parameters: tool.parameters as never,
+              output: { schema: { type: 'string' }, render: (_x: unknown, v: unknown) => [{ type: 'text', text: String(v) }] },
+              async execute(args: Record<string, unknown>) {
+                return String(await tool.execute(args, ctx))
+              },
+            })))
+            tool.disposer = () => dispose()
+            logger.info('[super-injector] 已恢复转正工具 %s', name)
+          } catch { /* 恢复注册失败：保持后侧，不炸 apply */ }
+        }
+      }
+    } catch (e) {
+      logger.warn('[super-injector] staging 恢复失败: %s', String(e))
+    }
+  }
+  restoreStaging()
 
   safeRegister(defineTool({
     name: 'dev_stage_add',
@@ -462,8 +607,10 @@ export function apply(ctx: AppContext, config: Config): void {
         description: String(args.description ?? ''),
         parameters: (args.parameters && typeof args.parameters === 'object') ? args.parameters : {},
         execute: fn as StagedTool['execute'],
+        source: String(args.execute),
         promoted: false,
       })
+      saveStaging()
       return `OK: ${args.name} 已挂后侧（staging，不进 schema，缓存零污染）。测试: dev_stage_call ${args.name} {"...":...}；转正: dev_stage_promote ${args.name}`
     },
   }))
@@ -524,6 +671,7 @@ export function apply(ctx: AppContext, config: Config): void {
         return 'ERROR: 转正注册失败: ' + String(e)
       }
       t.promoted = true
+      saveStaging()
       return `OK: ${a.name} 已转正挂前侧（进 schema）。注意：下一次请求将刷新缓存（唯一一次全灭）。`
     },
   }))
@@ -546,6 +694,7 @@ export function apply(ctx: AppContext, config: Config): void {
         }
       }
       staged.delete(a.name)
+      saveStaging()
       return `OK: ${a.name} 已从 staging 移除${unregistered}`
     },
   }))
@@ -569,6 +718,164 @@ export function apply(ctx: AppContext, config: Config): void {
   }
 
   // ============ 注入器核心 ============
+  /**
+   * 清除 loader 对账标记的 disabled（幽灵 entry 隔离）：
+   * 运行时 create 的 entry 不在配置树里，loader 对账（include.refresh /
+   * config 变更监听）会把它标 disabled 防双实例——而 client-modules 的
+   * processOne 要求 !entry.disabled 才注册 client 模块（**注入插件的 UI
+   * 不生效的根因**）。注入器语义：注入 = 完整生效（host 工具 + client UI），
+   * 因此注入/重载后立即清除 disabled，让 client 模块可注册。
+   * 对账只在 config 变更时触发，清除后不再次对账不会复发。
+   */
+  function normalizeEntry(entry: any): void {
+    if (!entry) return
+    try {
+      const o = entry.options
+      if (o && o.disabled !== undefined && o.disabled !== null) {
+        delete o.disabled
+        // 同步所属 group 的 data（loader 对账读取的是 group.data）
+        const parent = entry.parent
+        if (parent && Array.isArray(parent.data)) {
+          for (const d of parent.data) {
+            if (d && d.id === entry.id && d.disabled !== undefined) delete d.disabled
+          }
+        }
+      }
+    } catch { /* 清理失败不阻塞 */ }
+  }
+
+  /** 按包名清除所有同名 entry 的 disabled（注入/重载后统一调用）。 */
+  function normalizeEntriesByName(name: string): void {
+    for (const entry of ctx.loader.entries()) {
+      const o = entry.options
+      if (o.group) continue
+      if (o.name === name || o.name.includes(name)) normalizeEntry(entry)
+    }
+  }
+
+  /**
+   * 清理同名残留 entry（disposed/failed 且无活跃 fiber），防堆积：
+   * 注入失败/自杀失败的旧 entry 会留在 loader 树里，重载时 findEntry
+   * 虽已活跃优先，但残留多了会让状态列表失真、`waitFiberStable` 轮询错位。
+   */
+  function cleanupStaleEntries(name: string): void {
+    for (const entry of ctx.loader.entries()) {
+      const o = entry.options
+      if (o.group) continue
+      if (o.name !== name) continue
+      const st = entry.fiber ? FIBER_NAMES[entry.fiber.state] : 'no-fiber'
+      if (st === 'active') continue
+      try {
+        const p = entry.parent.remove(entry.id, true)
+        if (p && typeof p.then === 'function') p.catch(() => { /* 忽略 */ })
+        logger.info('[super-injector] 清理残留 entry %s（%s）', entry.id, st)
+      } catch { /* 清理失败不阻塞 */ }
+    }
+  }
+
+  /**
+   * client-modules 增量补扫：normalize disabled 发生在 loader.create 的
+   * microtask flush **之后**（create await 期间 flush 已用旧 disabled 拒绝），
+   * 必须主动重跑 processOne 让注入插件的 client 模块（UI）注册成功。
+   * 直接调 private 方法（TS private 编译后是普通属性，运行时可见）。
+   */
+  function refreshClientRow(name: string): void {
+    try {
+      const cm = ctx.get('clientModules') as {
+        processOne?: (entryName: string) => boolean
+        compose?: () => unknown
+        composed?: unknown
+        notifyGraphChanged?: () => void
+      } | undefined
+      if (!cm || typeof cm.processOne !== 'function') return
+      const changed = cm.processOne(name)
+      if (changed && typeof cm.compose === 'function' && typeof cm.notifyGraphChanged === 'function') {
+        cm.composed = cm.compose()
+        cm.notifyGraphChanged()
+        logger.info('[super-injector] client 模块已注册 %s', name)
+      }
+    } catch (e) {
+      logger.warn('[super-injector] client 模块补扫失败: %s', String(e))
+    }
+  }
+
+  /**
+   * 通知 client-modules 重哈希 bundle（rebuilt 是 HMR watch 注册钩子）：
+   * host 热重载后 client bundle rev 变化 → onGraphChanged → 浏览器端
+   * HMR/刷新拉新 bundle——改 UI 代码 → build:client → reload → 免手动刷新。
+   */
+  function notifyClientRebuilt(name: string): void {
+    try {
+      const cm = ctx.get('clientModules') as { rebuilt?: (id: string) => string | undefined } | undefined
+      if (cm && typeof cm.rebuilt === 'function') {
+        const rev = cm.rebuilt(name)
+        if (rev) logger.info('[super-injector] client bundle 已联动（rev=%s）', rev)
+      }
+    } catch { /* client 联动失败不阻塞 */ }
+  }
+
+  /** 卸载后从 client 模块表移除行（client-modules 只订阅 internal/plugin 增事件，卸载不自动清）。 */
+  function removeClientRow(name: string): void {
+    try {
+      const cm = ctx.get('clientModules') as {
+        table?: Map<string, unknown>
+        compose?: () => unknown
+        composed?: unknown
+        notifyGraphChanged?: () => void
+      } | undefined
+      if (!cm || !cm.table) return
+      if (cm.table.delete(name)) {
+        if (typeof cm.compose === 'function' && typeof cm.notifyGraphChanged === 'function') {
+          cm.composed = cm.compose()
+          cm.notifyGraphChanged()
+        }
+        logger.info('[super-injector] client 模块表已移除 %s', name)
+      }
+    } catch { /* 清理失败不阻塞 */ }
+  }
+
+  // ═══ 操作自检与统计：每次注入/重载/卸载/安装后验证 client 模块状态并
+  // 记账——操作结果可验证（host ✓ / client ✓），成功率可追溯（准确率）。
+  // 统计为进程内存（自重载清零，属本次运行期口径）。
+  const opStats = {
+    inject: { ok: 0, fail: 0 },
+    reload: { ok: 0, fail: 0 },
+    uninject: { ok: 0, fail: 0 },
+    install: { ok: 0, fail: 0 },
+  }
+
+  /** 验证 client 模块注册状态（host 侧已完成后的第二验证面）。 */
+  function clientStatus(name: string): string {
+    try {
+      const cm = ctx.get('clientModules') as {
+        clientPath?: (id: string) => string | undefined
+        table?: Map<string, unknown>
+      } | undefined
+      if (!cm || typeof cm.clientPath !== 'function') return 'client 服务不可用'
+      let path = cm.clientPath(name)
+      if (!path && cm.table && typeof cm.table.keys === 'function') {
+        // match 可能是短名（如 'dsh-engram-relay'），client 表 key 是完整包名
+        // （'@dsh-external/dsh-engram-relay'）——按子串宽松匹配避免误报。
+        for (const key of cm.table.keys()) {
+          if (String(key).includes(name)) {
+            path = cm.clientPath(key)
+            break
+          }
+        }
+      }
+      return path ? `client ✓ (${path.split(/[\\/]/).slice(-2).join('/')})` : 'client ✗（未注册——插件无 client 声明或注册失败）'
+    } catch {
+      return 'client 状态未知'
+    }
+  }
+
+  /** 记录一次操作结果（ok=true 记成功，否则记失败）。 */
+  function recordOp(kind: keyof typeof opStats, ok: boolean): void {
+    const bucket = opStats[kind]
+    if (ok) bucket.ok += 1
+    else bucket.fail += 1
+  }
+
   /** 注入一个本地插件包：junction → loader.create → 记录清单。 */
   async function inject(dir: string): Promise<string> {
     const absDir = resolve(dir)
@@ -582,6 +889,9 @@ export function apply(ctx: AppContext, config: Config): void {
     }
     const pkgName = pkg.name
     if (!pkgName) return 'ERROR: package.json 缺 name'
+
+    // 清理同名残留 entry（disposed/failed），防止堆积与重载错位
+    cleanupStaleEntries(pkgName)
 
     if (hasActiveEntry(pkgName)) return `INFO: ${pkgName} 已激活运行，跳过注入`
     purgeCache(absDir)
@@ -605,13 +915,20 @@ export function apply(ctx: AppContext, config: Config): void {
     } catch (e) {
       return `ERROR: loader.create 失败: ${e instanceof Error ? e.stack : String(e)}`
     }
+    // 清 disabled（幽灵 entry 隔离）：注入即完整生效（host + client UI）
+    normalizeEntriesByName(pkgName)
+    // client 模块补扫（loader.create 的 microtask flush 在 normalize 前已跑）
+    refreshClientRow(pkgName)
 
     const list = readRegistry()
     if (!list.some(e => e.dir === absDir)) {
       list.push({ dir: absDir, name: pkgName, at: new Date().toISOString() })
       writeRegistry(list)
     }
-    return `OK: ${pkgName} 已注入（junction=${linkDir}，entry 已装配）`
+    const hostOk = hasActiveEntry(pkgName)
+    const client = clientStatus(pkgName)
+    recordOp('inject', hostOk)
+    return `OK: ${pkgName} 已注入（junction=${linkDir}）\n- host ${hostOk ? '✓' : '✗'}\n- ${client}`
   }
 
   /** 卸载一个已注入的插件包：卸 entry（fiber dispose）→ 清 registry → 删 junction。 */
@@ -677,6 +994,12 @@ export function apply(ctx: AppContext, config: Config): void {
     } else {
       steps.push('（未找到完整包名，跳过 junction 清理）')
     }
+    // 4. client 模块表移除（client-modules 只订阅 internal/plugin 增事件，卸载不自动清）
+    if (fullName) {
+      removeClientRow(fullName)
+      steps.push('client 模块表已清理')
+    }
+    recordOp('uninject', steps.some(s => s.startsWith('entry 已卸载')))
     return 'OK: 卸载完成\n- ' + steps.join('\n- ')
   }
 
@@ -740,18 +1063,25 @@ export function apply(ctx: AppContext, config: Config): void {
   if (config.autoRestore) void restore()
 
   // ============ 自动轮询 watch：build 产物变化 → 自动整包重载 ============
+  // watch 源 = 配置 watches + 注入清单（registry）——注入即自动 watch，
+  // 自重载后动态 watch 不丢失（registry 持久）；改代码 → build → ~1.5s 自动生效。
   const fingerprints = new Map<string, string>()
   let reloading = false
   ctx.setInterval(() => {
     if (reloading) return
-    for (const w of watches) {
+    const watchList: Array<{ dir: string; match: string }> = [...watches]
+    for (const e of readRegistry()) {
+      if (!watchList.some(w => w.dir === e.dir)) watchList.push({ dir: e.dir, match: e.name })
+    }
+    for (const w of watchList) {
       const fp = fingerprintOf(join(w.dir, 'lib'))
       if (fp === null) continue
       const prev = fingerprints.get(w.dir)
       if (prev !== undefined && prev !== fp) {
         fingerprints.set(w.dir, fp)
         reloading = true
-        reloadPackage(w.match)
+        // match 用于 entry 查找，dir 用于 URL 匹配（loadCache key 是 file URL）
+        reloadPackage(w.match, w.dir)
           .then(r => logger.info('[super-injector] %s', r))
           .catch(e => logger.warn('[super-injector] %s', e instanceof Error ? e.stack : String(e)))
           .finally(() => { reloading = false })
@@ -831,7 +1161,7 @@ export function apply(ctx: AppContext, config: Config): void {
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
     async execute(args: { prefix: string }) {
-      const hs = ctx.httpServer
+      const hs = ctx.webServer
       const out: string[] = []
       for (const tableName of ['exact', 'prefixes', 'upgrades'] as const) {
         const table = hs?.[tableName]
@@ -881,7 +1211,10 @@ export function apply(ctx: AppContext, config: Config): void {
       render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
     },
     async execute() {
-      return '===== 当前已装配插件（loader entries）=====\n' + listPlugins()
+      const summary = Object.entries(opStats)
+        .map(([k, v]) => `${k} ${v.ok}✓/${v.fail}✗`)
+        .join(' | ')
+      return `===== 操作统计（本次运行期）=====\n${summary}\n\n===== 当前已装配插件（loader entries）=====\n` + listPlugins()
     },
   }))
 
@@ -950,13 +1283,20 @@ export function apply(ctx: AppContext, config: Config): void {
           const opts = entry.options as { name?: string }
           if (opts?.name === name) { exists = true; break }
         }
-        if (exists) steps.push('loader entry 已存在（跳过 create）')
-        else {
+        if (exists) {
+          steps.push('loader entry 已存在（跳过 create）')
+          normalizeEntriesByName(name)
+          refreshClientRow(name)
+        } else {
           await ctx.loader.create({ name })
+          normalizeEntriesByName(name)
+          refreshClientRow(name)
           steps.push('loader.create 已热装配（免重启生效）')
         }
 
-        return 'OK: ' + name + ' 热装配完成\n- ' + steps.join('\n- ') + '\n（重启后由 bundles 列表正常装配，双路径一致；patch 层配置重启后接管）'
+        const client = clientStatus(name)
+        recordOp('install', steps.some(s => s.startsWith('dependencies +=') || s.startsWith('dependencies 已存在')))
+        return 'OK: ' + name + ' 热装配完成\n- ' + steps.join('\n- ') + `\n- ${client}\n（重启后由 bundles 列表正常装配，双路径一致；patch 层配置重启后接管）`
       } catch (e) {
         return 'ERROR: 安装失败: ' + String(e)
       }
@@ -964,13 +1304,16 @@ export function apply(ctx: AppContext, config: Config): void {
     },
   }))
 
-  // ============ 能力提示注入（缓存友好：固定内容 + 最尾 order）============
-  // 参考官方 system prompt 设计：静态模板稳定、动态内容尾部化。本段每轮渲染
-  // 完全相同（常量 text），order 9998 排在一切之后——不破坏 LLM 前缀缓存。
+  // ============ 静态能力提示注入（缓存原则：静态到头、动态到尾）============
+  // - 静态内容（身份/能力声明，编译期常量）→ order 靠前（头部）：tools schema
+  //   变更（注入/转正工具）时静态段仍在缓存前缀内，只伤 schema 之后；
+  // - 动态内容（记忆检索/实时状态）→ 严禁进 system 头部：走消息尾追加
+  //   （engram-relay 的尾部注入即此模式）或 system 最尾，变化只伤自身之后；
+  // - 本段 text 必须保持编译期常量——任何每轮变化的动态拼接都会全灭前缀缓存。
   ctx.systemPrompt.context({
     name: 'dsh-super-injector',
-    order: 9998,
-    text: '本环境支持插件注入与热重载：dev_inject_plugin 运行时注入、dev_reload_package 整包重载、改代码 build 后约 1.5 秒自动生效（细节见各工具描述）。',
+    order: -90,
+    text: 'dev_inject_plugin 等 dev_* 工具属于 dsh-super-injector（插件热插拔 + 自主迭代）。若它无法实现此目的，优先修复注入器。',
   })
 
   logger.info('[super-injector] 就绪：watch %d 目录（%dms），autoRestore=%s', watches.length, intervalMs, String(config.autoRestore))
