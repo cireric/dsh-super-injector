@@ -2109,23 +2109,39 @@ export function apply(ctx: AppContext, config: Config): void {
       if (!dir) return 'ERROR: dir 必填（插件包目录绝对路径）'
       // ⚠️ 注入前 client 骨架校验（2026-08 pixel-forge 事件教训：参考源污染
       // 会把"缺 inject/name"的老坑传播给新插件——注入即检查，有问题先修再注入）
+      // 2026-08-14 升级（用户反馈）：①同时检查编译产物 lib/client.js（只有
+      // lib 无 src 的插件此前绕过检查）②缺 inject 改为**阻断**（警告不够——
+      // 漏 inject 的 client 注入后 Tab 必挂）
       try {
-        const clientSrcPath = join(resolve(dir), 'src', 'client', 'index.ts')
+        const base = resolve(dir)
+        const problems: string[] = []
+        // 1. 编译产物（实际运行文件）——lib/client.js（CJS bundle）
+        const libClient = join(base, 'lib', 'client.js')
+        if (existsSync(libClient)) {
+          const lib = readFileSync(libClient, 'utf8')
+          if (!/inject\s*=\s*\[[^\]]*'slots'/.test(lib) && !/inject\s*:\s*\[[^\]]*'slots'/.test(lib)) {
+            problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
+          }
+          if (!/name:\s*['"]conversation\.view['"]/.test(lib)) {
+            problems.push("lib/client.js 的 register 缺 name: 'conversation.view'（= slot 名）")
+          }
+        }
+        // 2. 源码骨架（有 src 时）
+        const clientSrcPath = join(base, 'src', 'client', 'index.ts')
         if (existsSync(clientSrcPath)) {
           const src = readFileSync(clientSrcPath, 'utf8')
-          const problems: string[] = []
           if (!/export const inject\s*=\s*\[[^\]]*'slots'/.test(src)) {
             problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
           }
           if (!/register\(\{[\s\S]*?name:\s*['"]conversation\.view['"]/.test(src)) {
             problems.push("slots.register 缺 name: 'conversation.view'（= slot 名，缺了报 slot undefined is not declared）")
           }
-          if (problems.length > 0) {
-            return '⚠️ 注入前校验发现 client 骨架问题（不阻断注入，但 Tab 大概率不生效）：\n- ' + problems.join('\n- ')
-              + '\n建议先修复再注入（参照脚手架模板 SCAFFOLD_UI_CLIENT 或 dsh-engram-relay/src/client/index.ts）'
-          }
         }
-      } catch { /* 校验失败不阻断注入（无 src 目录时跳过） */ }
+        if (problems.length > 0) {
+          return 'ERROR: 注入前校验发现 client 骨架问题（已阻断——缺 inject 的 client 注入后 Tab 必挂）：\n- ' + problems.join('\n- ')
+            + '\n修复：参照脚手架模板（dev_scaffold_plugin ui-panel/hybrid）补上 export const inject = [\'slots\'] → 重新 build → 再注入'
+        }
+      } catch { /* 校验失败不阻断注入（读不到文件时跳过） */ }
       return withOpLock(() => inject(dir))
     },
   }))
