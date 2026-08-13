@@ -1208,6 +1208,9 @@ export function apply(ctx: AppContext, config: Config): void {
     // 1.5 阻断 bundle patch 自装配：插件自带 cordis.patch.yml 会 insert 自己，
     // include.refresh 会把刚卸的 entry 加回（卸载不全的根因）。在 profile patch
     // 写 disabled 覆盖（loader patch 同 id 的 disabled 优先于 bundle 层 insert）。
+    // ⚠️ 必须解析式追加（实测踩坑）：官方 patch 文件初始是顶层 `[]`（空数组），
+    // 若盲 append `- id:` 会产生**两个顶层 YAML 值** → 解析必炸。正确做法：
+    // 移除顶层 `[]` 空数组后再追加条目，保证文件始终是单一顶层值（列表）。
     if (fullName) {
       try {
         const patchFile = join(profileNodeModules, '..', 'cordis.patch.yml')
@@ -1215,8 +1218,10 @@ export function apply(ctx: AppContext, config: Config): void {
           const content = readFileSync(patchFile, 'utf8')
           const idShort = fullName.split('/').pop()
           if (idShort && !content.includes(`id: ${idShort}`)) {
-            appendFileSync(patchFile, `\n# 已卸载插件（${fullName}）：disabled 阻断其 bundle patch 自装配\n- id: ${idShort}\n  disabled: true\n`)
-            steps.push('profile patch 已写 disabled（阻断自装配，防 refresh 加回）')
+            // 顶层空数组 []（独立一行）→ 移除，后续条目成为唯一顶层值
+            const cleaned = content.replace(/^\s*\[\]\s*$/m, '')
+            writeFileSync(patchFile, cleaned + `\n# 已卸载插件（${fullName}）：disabled 阻断其 bundle patch 自装配\n- id: ${idShort}\n  disabled: true\n`, 'utf8')
+            steps.push('profile patch 已写 disabled（阻断自装配，防 refresh 加回；已兼容 [] 初始形式）')
           }
         }
       } catch (e) {
