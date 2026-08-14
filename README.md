@@ -183,10 +183,13 @@ export function apply(ctx: AppContext): void {
 1. **资源注册必须挂 `ctx.effect`**（工具/路由/监听）——热重载/卸载才能自动清理，否则僵尸残留（注入器自己踩过）
 2. **peerDependencies 用范围声明**（`>=0.0.1-rc <2`、`>=4.0.0-rc <5`）——不硬编码版本，DSH 升级不报废
 3. **client bundle 需单独构建**（tsdown → lib/client.js）——UI 形态两步构建
-4. **提示词注入遵守缓存原则**：静态文本 + order 靠前（静态到头）；动态内容走消息尾（动态到尾）；严禁动态拼接进 system
+4. **提示词注入遵守缓存原则**：静态文本 + order 靠前（静态到头）；动态内容走消息尾（动态到尾）；严禁动态拼接进 system——**system 前缀任何动态变化 = 整个会话缓存全量 miss**（命中便宜 10 倍）
 5. **自检**：改完代码跑一次 `dev_self_test`，确保注入/重载/自重载/预检/卸载全链路不退化
 6. **首轮锚定**（V4 Pro 实测，参考 [dsh-anchored-standard](https://github.com/xiaobright/dsh-anchored-standard)，Project2 98/99）：工具面大（≥5 个）时，首轮请求只暴露最核心的 1-2 个工具，首个 `tool/call` 后恢复全部——首轮请求结构决定整条会话的策略轨迹，锚定训练对齐的窄工具面再放开，能力不损。实现：`system-prompt/assemble` Waterfall 过滤器（骨架已自带，见 dev_scaffold_plugin）
 7. **工具 schema 精简**：description 用短句点明用途，详解放 tool result / 静态引导文本，不要写进 schema——工具目录按字符计费进首轮 prefill，实测 6 插件可膨胀到 17.6 万字符，稀释首轮注意力且无缓存 prefill 最贵（缓存命中便宜 10 倍）
+8. **近距离信号原则（最强机制，P14/P16/P20 实测）**：所有行为引导（分类/深度思考/收敛）必须注入在**用户消息之后**（近距离），同一指令放 system（远距离）会衰减甚至反向（P13 协议加速衰减、P20 深度段进 persona 路由崩到 67%）；固定文本保持缓存命中（92-94%）
+9. **弱域内路由（P8/P11）**：任务类型模糊时不要武断选模式——用弱 persona（模型自己分类），**按模型选 persona**（Pro=spec句+few-shot，Flash=neutral+classify，同一 persona 两模型行为可相反）
+10. **单任务长链路三锚（P22/P23）**：开放任务探索失控是主病（完成率 0%）——persona 静态锚「回顾已完成 + 信息足够就产出 + 禁止环境检查/穷举 grep」把完成率拉到 100%
 
 ### 高性能插件（首轮锚定 · 为什么 & 怎么做）
 
@@ -198,6 +201,19 @@ export function apply(ctx: AppContext): void {
 3. 首次工具调用后自动恢复全部工具，resume/reload 不丢状态（阶段从持久 session events 推导）。
 
 **验证**：导出 session JSONL 看 `request/header`——第一份只含核心工具，首次工具调用后的下一份变更 header 含完整目录，此后保持。
+
+### 高性能引导的完整认知（v0.3.3 更新，基于 dsh-router-standard P1-P23 实测）
+
+| 机制 | 实测 | 落地 |
+|---|---|---|
+| 首轮锚定（窄工具面） | Project2 98/99 | tool-bootstrap 过滤器（骨架自带） |
+| **近距离引导**（用户消息后注入） | 零衰减（远距离同指令加速衰减） | 插件监听 session/event → inbox.append 固定引导 |
+| **弱域内路由**（模糊任务交模型自分类） | 区分度 +5~5.7，按模型选 persona | weak 模式（dev_router_mode weak） |
+| **deep-guide**（分类+深度思考+commit） | 路由 96% + 收敛 100% + 反稀释 | 近距离固定引导文本 |
+| **单任务三锚**（回顾+收敛+反跑题） | 完成率 0%→100% | persona 静态锚 |
+| plan-mode section 保留 | 失忆修复（v6） | applyPersona 只换 persona section |
+
+完整实现与复现探针：[dsh-router-standard](https://github.com/yjh051108/dsh-router-standard)（v0.1.0，含论文与 P1-P23 全数据）。
 
 **参考与致谢**：本引导中的「首轮锚定」机制与统计证据，参考了 **xiaobright** 的开源工作——
 [`dsh-anchored-standard`](https://github.com/xiaobright/dsh-anchored-standard)（MIT，
