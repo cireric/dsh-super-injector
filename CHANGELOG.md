@@ -2,6 +2,24 @@
 
 本项目版本与仓库提交对应，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.3.1] — 2026-08-14
+
+### 修复（pixel-forge 事件根治——坏 client 挂死 HARNESS）
+
+- **autoRestore 恢复前 client 校验**：坏 client 插件（缺 inject）恢复时**跳过 + 审计**（此前恢复路径无校验——坏插件在 registry → 新会话启动 → client apply 失败 → 整个 HARNESS "Failed to load plugins"——用户被迫手动修）
+- **校验正则兼容单双引号**：用户手修的双引号 `inject = ["slots"]` 被误判为"缺 inject"的 bug
+- **clientSkeletonProblems 公共化**：注入阻断 / 恢复跳过共用同一校验逻辑（一条防线两处生效）
+
+### 新增
+
+- 注入前 client 骨架校验升级（v0.3.0 并入）：同时检查编译产物 lib/client.js（只有 lib 无 src 不绕过）+ 缺 inject 阻断注入
+
+### 验证
+
+- 双引号 inject 假插件注入通过（不误判）
+- 坏 client 假插件注入阻断
+- 自检 8/8 无回归
+
 ## [0.2.6] — 2026-08-14
 
 ### 修复
