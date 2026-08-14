@@ -1942,8 +1942,40 @@ export function apply(ctx: AppContext, config: Config): void {
   }
 
   /** 启动自动恢复：① bundle junction 断电自愈（profile packages 的 link:）→ ② 注入清单逐个重新注入。 */
-  async function restore(): Promise<void> {
-    // ① profile bundle junction 自愈：断电/强制关机后 junction 悬空 → 重建。
+  /** client 骨架校验（注入前 + autoRestore 恢复前共用——pixel-forge 事件教训：
+   * 坏 client 插件在 registry → 新会话恢复 → apply 失败 → HARNESS 启动失败）。
+   * 返回问题列表（空 = 健康）。lib 与 src 双检查（只有 lib 无 src 不绕过）。 */
+  function clientSkeletonProblems(base: string): string[] {
+    const problems: string[] = []
+    try {
+      // 1. 编译产物（实际运行文件）——lib/client.js（CJS bundle）
+      // ⚠️ 正则兼容单双引号（实测：用户手修用 "slots" 双引号——只认单引号会误判健康插件）
+      const libClient = join(base, 'lib', 'client.js')
+      if (existsSync(libClient)) {
+        const lib = readFileSync(libClient, 'utf8')
+        if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
+          problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
+        }
+        if (!/name:\s*['"]conversation\.view['"]/.test(lib)) {
+          problems.push("lib/client.js 的 register 缺 name: 'conversation.view'（= slot 名）")
+        }
+      }
+      // 2. 源码骨架（有 src 时）
+      const clientSrcPath = join(base, 'src', 'client', 'index.ts')
+      if (existsSync(clientSrcPath)) {
+        const src = readFileSync(clientSrcPath, 'utf8')
+        if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
+          problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
+        }
+        if (!/register\(\{[\s\S]*?name:\s*['"]conversation\.view['"]/.test(src)) {
+          problems.push("slots.register 缺 name: 'conversation.view'（= slot 名，缺了报 slot undefined is not declared）")
+        }
+      }
+    } catch { /* 读不到文件时跳过 */ }
+    return problems
+  }
+
+  async function restore(): Promise<void> {    // ① profile bundle junction 自愈：断电/强制关机后 junction 悬空 → 重建。
     //    （dev_install_package 装的 bundle 在 profile package.json，junction 失效会导致装配失败——此前无覆盖，需手动修）
     try {
       const profileDir = dirname(config.profileNodeModules)
@@ -1980,6 +2012,15 @@ export function apply(ctx: AppContext, config: Config): void {
     for (const e of readRegistry()) {
       try {
         if (hasActiveEntry(e.name)) continue
+        // ⚠️ 恢复前 client 骨架校验（pixel-forge 事件教训：坏 client 插件
+        // 恢复 → apply 失败 → 整个 HARNESS 启动失败——用户被迫手动修）。
+        // 有问题的插件跳过恢复 + 审计（保留 registry——修复后下次启动恢复）。
+        const problems = clientSkeletonProblems(e.dir)
+        if (problems.length > 0) {
+          auditLog('restore-skip-bad-client', `${e.name} client 骨架问题，跳过恢复: ${problems.join('; ')}`)
+          logger.warn('[super-injector] 恢复 %s 跳过（client 骨架问题）: %s', e.name, problems.join('; '))
+          continue
+        }
         await inject(e.dir)
         logger.info('[super-injector] 自动恢复 %s', e.name)
       } catch (err) {
@@ -2111,37 +2152,14 @@ export function apply(ctx: AppContext, config: Config): void {
       // 会把"缺 inject/name"的老坑传播给新插件——注入即检查，有问题先修再注入）
       // 2026-08-14 升级（用户反馈）：①同时检查编译产物 lib/client.js（只有
       // lib 无 src 的插件此前绕过检查）②缺 inject 改为**阻断**（警告不够——
-      // 漏 inject 的 client 注入后 Tab 必挂）
-      try {
-        const base = resolve(dir)
-        const problems: string[] = []
-        // 1. 编译产物（实际运行文件）——lib/client.js（CJS bundle）
-        const libClient = join(base, 'lib', 'client.js')
-        if (existsSync(libClient)) {
-          const lib = readFileSync(libClient, 'utf8')
-          if (!/inject\s*=\s*\[[^\]]*'slots'/.test(lib) && !/inject\s*:\s*\[[^\]]*'slots'/.test(lib)) {
-            problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
-          }
-          if (!/name:\s*['"]conversation\.view['"]/.test(lib)) {
-            problems.push("lib/client.js 的 register 缺 name: 'conversation.view'（= slot 名）")
-          }
-        }
-        // 2. 源码骨架（有 src 时）
-        const clientSrcPath = join(base, 'src', 'client', 'index.ts')
-        if (existsSync(clientSrcPath)) {
-          const src = readFileSync(clientSrcPath, 'utf8')
-          if (!/export const inject\s*=\s*\[[^\]]*'slots'/.test(src)) {
-            problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
-          }
-          if (!/register\(\{[\s\S]*?name:\s*['"]conversation\.view['"]/.test(src)) {
-            problems.push("slots.register 缺 name: 'conversation.view'（= slot 名，缺了报 slot undefined is not declared）")
-          }
-        }
-        if (problems.length > 0) {
-          return 'ERROR: 注入前校验发现 client 骨架问题（已阻断——缺 inject 的 client 注入后 Tab 必挂）：\n- ' + problems.join('\n- ')
-            + '\n修复：参照脚手架模板（dev_scaffold_plugin ui-panel/hybrid）补上 export const inject = [\'slots\'] → 重新 build → 再注入'
-        }
-      } catch { /* 校验失败不阻断注入（读不到文件时跳过） */ }
+      // 漏 inject 的 client 注入后 Tab 必挂）③restore 恢复路径同样校验
+      // （pixel-forge 事件：坏 client 插件在 registry → 新会话 autoRestore
+      // 恢复 → client apply 失败 → 整个 HARNESS 启动失败——用户被迫手动修）
+      const problems = clientSkeletonProblems(resolve(dir))
+      if (problems.length > 0) {
+        return 'ERROR: 注入前校验发现 client 骨架问题（已阻断——缺 inject 的 client 注入后 Tab 必挂）：\n- ' + problems.join('\n- ')
+          + '\n修复：参照脚手架模板（dev_scaffold_plugin ui-panel/hybrid）补上 export const inject = [\'slots\'] → 重新 build → 再注入'
+      }
       return withOpLock(() => inject(dir))
     },
   }))
