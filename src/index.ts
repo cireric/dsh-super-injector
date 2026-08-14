@@ -704,10 +704,18 @@ export function apply(ctx: AppContext, config: Config): void {
   }
 
   /**
-   * ═══ 统一 profile patch 写入（F：防 YAML 双顶层值——实测踩坑）═══
+   * ═══ 统一 profile patch 写入（F：防 YAML 双顶层值 + 防重复 id——实测踩坑）═══
    * 官方 patch 初始是顶层 `[]`（空数组）；盲 append `- id:` 会产生两个顶层
    * YAML 值 → 解析必炸。本函数：移除顶层 `[]` 再追加条目，保证文件始终
-   * 单一顶层值（列表）。所有写 profile patch 的路径必须走这里。
+   * 单一顶层值（列表）。
+   *
+   * ═══ 幂等去重（2026-08-15 别人机器 duplicate loader entry id 教训）═══
+   * 手动 patch / 重复安装 / 多路径写入都可能让同 id entry 出现两次——dsh
+   * loader 装配遇同 id 直接抛 `duplicate loader entry id`，整个 plugin tree
+   * 加载失败（启动即崩），且注入器自身无法自愈（鸡生蛋）。因此：
+   *  1. 写入前扫描现有条目 id；若 appendText 的 id 已存在 → 不追加（幂等）；
+   *  2. 对历史重复：重写文件时按 id 去重（保留最后一条，注释块保留）；
+   *  3. heal/self-test 等触碰 patch 的路径全部走这里，杜绝盲 append。
    * @param appendText - 要追加的条目文本（含换行，如 `- id: xxx\n  disabled: true\n`）
    * @returns 是否发生了写入
    */
@@ -717,12 +725,52 @@ export function apply(ctx: AppContext, config: Config): void {
       mkdirSync(dirname(patchFile), { recursive: true })
       let content = ''
       try { content = readFileSync(patchFile, 'utf8') } catch { /* 不存在按空处理 */ }
-      const cleaned = content.replace(/^\s*\[\]\s*$/m, '')
-      writeFileSync(patchFile, cleaned + appendText, 'utf8')
+      // 1. 收集 appendText 携带的 id（支持单条 `- id: x` 与 `- insert:` 包裹块）
+      const appendIds = [...appendText.matchAll(/^\s*- id:\s*([^\s#]+)/gm)].map((m) => m[1])
+      // 2. 提取现有内容里所有条目块（含注释），按 id 归组
+      const blocks = extractPatchBlocks(content)
+      const existing = new Set<string>()
+      const kept: string[] = []
+      for (const b of blocks) {
+        if (b.id) {
+          // 同 id 重复：只保留最后一条（后续同名覆盖先前的）
+          if (existing.has(b.id)) continue
+          existing.add(b.id)
+        }
+        kept.push(b.text)
+      }
+      // 3. 幂等：appendIds 全部已存在 → 不写入
+      if (appendIds.length > 0 && appendIds.every((id) => existing.has(id))) {
+        return false
+      }
+      // 4. 重写：去重后的现有块 + 追加文本
+      const cleanedTop = kept.join('').replace(/^\s*\[\]\s*$/m, '')
+      writeFileSync(patchFile, cleanedTop + appendText, 'utf8')
       return true
     } catch {
       return false
     }
+  }
+
+  /** 把 patch 内容切分为"条目块"（`- id:` 及其缩进子行 + 前置注释行）。 */
+  function extractPatchBlocks(content: string): Array<{ id?: string; text: string }> {
+    const lines = content.split('\n')
+    const blocks: Array<{ id?: string; text: string }> = []
+    let current: { id?: string; text: string } | null = null
+    for (const line of lines) {
+      const idMatch = /^\s*- id:\s*([^\s#]+)/.exec(line)
+      if (idMatch) {
+        if (current) blocks.push(current)
+        current = { id: idMatch[1], text: line }
+      } else if (current) {
+        current.text += '\n' + line
+      } else if (line.trim() !== '' && !/^\s*#/.test(line) && !/^\s*\[\]\s*$/.test(line)) {
+        // 非注释、非空、非条目的杂散行：保留原样（如 - insert: 包裹行）
+        blocks.push({ text: line })
+      }
+    }
+    if (current) blocks.push(current)
+    return blocks
   }
 
   /**
@@ -2457,6 +2505,68 @@ export function apply(ctx: AppContext, config: Config): void {
       return healed.length > 0
         ? `OK: 已重建 ${healed.length} 个 junction\n- ` + healed.join('\n- ')
         : 'OK: 全部 link: 依赖 junction 健康（无需修复）'
+    },
+  }))
+
+  safeRegister(defineTool({
+    name: 'dev_fix_patch',
+    description: 'profile patch 修复：扫描 ~/.dsh/profiles/*/cordis.patch.yml，按 entry id 去重（同 id 保留最后一条，备份原文件）——修复 "duplicate loader entry id" 启动崩溃（手动 patch 两次/重复安装造成）。--check 只查不写',
+    parameters: {
+      profile: { type: 'string', description: '只修指定 profile（缺省全部）' },
+      check: { type: 'boolean', description: '只检查不写入' },
+    },
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
+    },
+    async execute(args: { profile?: string; check?: boolean }) {
+      const profilesRoot = join(homedir(), '.dsh', 'profiles')
+      let profileDirs: string[] = []
+      try { profileDirs = readdirSync(profilesRoot).filter((d) => !d.startsWith('.')) } catch {
+        return 'ERROR: 未找到 profiles 目录: ' + profilesRoot
+      }
+      if (args.profile) profileDirs = profileDirs.filter((d) => d === args.profile)
+      if (!profileDirs.length) return 'ERROR: 未找到 profile: ' + (args.profile ?? '（空）')
+      const out: string[] = []
+      let fixedAny = false
+      for (const profile of profileDirs) {
+        const patchFile = join(profilesRoot, profile, 'cordis.patch.yml')
+        if (!existsSync(patchFile)) continue
+        let content = ''
+        try { content = readFileSync(patchFile, 'utf8') } catch { out.push(`[${profile}] 读取失败（跳过）`); continue }
+        const blocks = extractPatchBlocks(content)
+        const seen = new Set<string>()
+        const kept: string[] = []
+        const dup: Array<{ id: string; count: number }> = []
+        for (const b of blocks) {
+          if (b.id) {
+            if (seen.has(b.id)) {
+              const rec = dup.find((r) => r.id === b.id)
+              if (rec) rec.count += 1
+              else dup.push({ id: b.id, count: 1 })
+              continue
+            }
+            seen.add(b.id)
+          }
+          kept.push(b.text)
+        }
+        if (!dup.length) { out.push(`[${profile}] 健康：无重复 id`); continue }
+        fixedAny = true
+        for (const rec of dup) out.push(`[${profile}] 修复：id "${rec.id}" 重复，删除 ${rec.count} 条（保留最后一条）`)
+        if (args.check) continue
+        const bak = patchFile + '.bak-' + Date.now()
+        try {
+          renameSync(patchFile, bak)
+          writeFileSync(patchFile, kept.join('\n').replace(/\s*$/, '') + '\n', 'utf8')
+          out.push(`[${profile}] 已重写（备份: ${bak}）`)
+        } catch (e) {
+          out.push(`[${profile}] 写入失败: ${String(e instanceof Error ? e.message : e)}`)
+        }
+      }
+      out.push(fixedAny
+        ? (args.check ? '\n发现重复 id（未写入，--check 模式）' : '\n修复完成，现在可以重新启动 dsh')
+        : '\n全部 profile 健康')
+      return out.join('\n')
     },
   }))
 

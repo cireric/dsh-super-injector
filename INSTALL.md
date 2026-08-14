@@ -97,6 +97,54 @@ ln -s /你的路径/dsh-super-injector ~/.dsh/profiles/web/node_modules/@yjh0511
 ```
 
 > ⚠️ `cordis.patch.yml` 必须是**单一顶层值**（要么 `[]`，要么 `- id:` 列表，不能两者混存——否则 YAML 解析报错）。
+>
+> ⚠️ **同 id 条目只允许一条**（dsh loader 装配遇同 id 直接报 `duplicate loader entry id`，启动即崩）。
+> 方式 C 是给"什么都不依赖"的场景兜底的，**重复执行 / 重复粘贴会制造重复 id**。
+> 如果之前已经装过注入器（方式 A/B），**不要**再手动 patch 一次——先跑 `dev_fix_patch` 检查去重。
+
+---
+
+## 5. 故障修复：启动崩溃 `duplicate loader entry id`
+
+### 症状
+
+dsh 启动即退出，报错含：
+
+```
+Error: dsh: plugin tree failed to load: failed to apply loader entry include (cordis:include):
+duplicate loader entry id: <id>
+```
+
+**原因**：`~/.dsh/profiles/<profile>/cordis.patch.yml` 里同 id 条目出现两次（手动 patch
+重复执行、重复粘贴、或注入器旧版本盲追加写入）。dsh loader 要求 id 唯一。
+
+### 修复（dsh 起不来时）
+
+发布包自带独立修复脚本（零依赖，node 直接跑，不需要 dsh 启动）：
+
+```bash
+# 解压目录里（含 scripts/fix-patch.mjs）：
+node scripts/fix-patch.mjs            # 修复全部 profile（自动备份原文件）
+node scripts/fix-patch.mjs --check    # 只检查不写（退出码 0=健康 1=有重复）
+node scripts/fix-patch.mjs --profile web   # 只修 web profile
+```
+
+修复后重新启动 dsh 即可。
+
+### 修复（dsh 能启动时）
+
+直接让注入器修（等价操作，含备份）：
+
+```
+dev_fix_patch          # 修复全部 profile
+dev_fix_patch --check  # 只检查
+```
+
+### 预防
+
+- 注入器 ≥0.3.2 的 `writePatch` **按 id 幂等去重**——它自己写 patch（卸载 disabled、
+  self-test 等）不会再制造重复；已有重复也会在写入时顺带清理。
+- 手动 patch 前先确认没有装过注入器；装过就用 `dev_fix_patch --check` 验证。
 
 重启 web 后验证。
 
