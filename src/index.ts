@@ -2023,6 +2023,14 @@ export function apply(ctx: AppContext, config: Config): void {
     try {
       const pkgPath = join(base, 'package.json')
       if (!existsSync(pkgPath)) return { block, warn }
+      // ⚠️ UTF-8 BOM 检查（2026-08-14 v0.1.2 事故教训）：PowerShell 的
+      // Set-Content -Encoding UTF8 会写 BOM——package.json 带 BOM 会让
+      // tsdown/JSON.parse 直接失败（client 构建不出来），而产物检查查
+      // 不到（旧产物还在，特征正常）。BOM 在 package.json 里永远是错的。
+      const pkgBuf = readFileSync(pkgPath)
+      if (pkgBuf.length >= 3 && pkgBuf[0] === 0xEF && pkgBuf[1] === 0xBB && pkgBuf[2] === 0xBF) {
+        block.push('package.json 带 UTF-8 BOM（EF BB BF）——tsdown/JSON.parse 无法解析，构建必挂；用无 BOM 工具重写（node 写文件，勿用 PowerShell Set-Content -Encoding UTF8）')
+      }
       const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as Record<string, unknown>
       const hasClient = !!(pkg.dsh as Record<string, unknown> | undefined)?.client
       // src 最新 mtime（host 与 client 分开算，避免只改 host 误报 client 过期）
@@ -2081,38 +2089,70 @@ export function apply(ctx: AppContext, config: Config): void {
     return { block, warn }
   }
 
-  async function restore(): Promise<void> {    // ① profile bundle junction 自愈：断电/强制关机后 junction 悬空 → 重建。
-    //    （dev_install_package 装的 bundle 在 profile package.json，junction 失效会导致装配失败——此前无覆盖，需手动修）
+  /**
+   * profile link: 依赖 junction 自愈（2026-08-14 扩展）。
+   *
+   * 正规语义：profile package.json 的 `link:` 依赖声明 → node_modules junction
+   * 物化。此前只对 `dsh.profile.bundles` 列表自愈；agent preset 行解析同样走
+   * node_modules（preset 挂载 `@dsh-external/dsh-music-forge` 等本地包时按
+   * ctx.baseUrl 解析）——deps 里 link: 声明但不在 bundles 的包（如
+   * dsh-music-forge 供 music-producer 预设）重启后 junction 会丢，预设挂载
+   * 失败。同一物化机制，同一重建逻辑，自愈范围推广到**全部 link: 依赖**。
+   * registry 包（非 link:）不在此列——它们的 node_modules 由包管理器管理。
+   * @returns 重建的 junction 描述列表（空 = 全部健康）。
+   */
+  function healProfileLinks(): string[] {
+    const healed: string[] = []
     try {
-      const profileDir = dirname(config.profileNodeModules)
+      // ⚠️ 必须用带 fallback 的局部常量 profileNodeModules（config 值为空串时
+      // dirname('') 解析到错误目录——曾致自愈扫描静默失败）
+      const profileDir = dirname(profileNodeModules)
       const profilePkg = JSON.parse(readFileSync(join(profileDir, 'package.json'), 'utf8'))
       const bundles: string[] = profilePkg?.dsh?.profile?.bundles ?? []
       const deps: Record<string, string> = profilePkg?.dependencies ?? {}
-      for (const name of bundles) {
+      const bundleSet = new Set(bundles)
+      const linkNames = Object.keys(deps).filter((n) => String(deps[n] ?? '').startsWith('link:'))
+      for (const name of linkNames) {
+        const target = String(deps[name]).slice(5)
+        if (!target || !existsSync(target)) continue // 目标不存在（旧机器路径）跳过
         const scope = name.startsWith('@') ? name.split('/')[0] : null
-        const linkDir = join(config.profileNodeModules, scope ?? '')
+        const linkDir = join(profileNodeModules, scope ?? '')
         const linkPath = join(linkDir, scope ? name.split('/')[1] as string : name)
         if (!isHealthyLink(linkPath)) {
+          try {
+            if (existsSync(linkPath)) rmdirSync(linkPath)
+          } catch { /* 坏链接删除失败忽略 */ }
+          try {
+            mkdirSync(linkDir, { recursive: true })
+            symlinkSync(target, linkPath, 'junction')
+            healed.push(`${name} → ${target}`)
+            logger.warn('[super-injector] 断电自愈：重建 junction %s → %s', name, target)
+          } catch (err) {
+            logger.warn('[super-injector] junction 重建失败 %s: %s', name, String(err))
+          }
+        }
+      }
+      // bundles 内 registry 包的悬空警告（保持原行为）
+      for (const name of bundles) {
+        if (bundleSet.has(name) && !linkNames.includes(name)) {
           const dep = deps[name] ?? ''
-          const target = dep.startsWith('link:') ? dep.slice(5) : ''
-          if (target && existsSync(target)) {
-            try {
-              if (existsSync(linkPath)) rmdirSync(linkPath)
-            } catch { /* 坏链接删除失败忽略 */ }
-            try {
-              mkdirSync(linkDir, { recursive: true })
-              symlinkSync(target, linkPath, 'junction')
-              logger.warn('[super-injector] 断电自愈：重建 junction %s → %s', name, target)
-            } catch (err) {
-              logger.warn('[super-injector] junction 重建失败 %s: %s', name, String(err))
-            }
-          } else {
-            logger.warn('[super-injector] bundle %s 的 junction 悬空且无有效 link: 目标', name)
+          if (!dep.startsWith('link:') && !isHealthyLink(join(profileNodeModules, ...(name.startsWith('@') ? name.split('/') : [name])))) {
+            logger.warn('[super-injector] bundle %s 非 link 依赖且 junction 异常（registry 包由包管理器管理）', name)
           }
         }
       }
     } catch (err) {
-      logger.warn('[super-injector] bundle junction 自愈扫描失败: %s', String(err))
+      logger.warn('[super-injector] link 依赖 junction 自愈扫描失败: %s', String(err))
+    }
+    return healed
+  }
+
+  async function restore(): Promise<void> {    // ① profile link 依赖 junction 自愈（断电/强制关机后 junction 悬空 → 重建；
+    //    覆盖 bundles 装配依赖 + agent preset 解析依赖，见 healProfileLinks）。
+    try {
+      healProfileLinks()
+    } catch (err) {
+      logger.warn('[super-injector] junction 自愈扫描失败: %s', String(err))
     }
     // ② 注入清单恢复（原逻辑）
     for (const e of readRegistry()) {
@@ -2370,6 +2410,23 @@ export function apply(ctx: AppContext, config: Config): void {
       const freshEntry = findEntry(args.packageName)
       const after = freshEntry ? await waitFiberStable(freshEntry) : '（未找到）'
       return result + '\n--- 重载前后状态 ---\nbefore: [' + before + ']\nafter: [' + after + ']'
+    },
+  }))
+
+  safeRegister(defineTool({
+    name: 'dev_heal_links',
+    description: 'profile link: 依赖 junction 自愈（手动触发，免重启）：扫描 profile package.json 全部 link: 依赖（bundles 装配依赖 + agent preset 解析依赖），悬空/缺失的 node_modules junction 重建。返回重建清单。',
+    parameters: {},
+    output: {
+      schema: { type: 'string' },
+      render: (_args: unknown, value: unknown) => [{ type: 'text', text: String(value) }],
+    },
+    async execute() {
+      const healed = healProfileLinks()
+      recordOp('selfHeal', healed.length === 0)
+      return healed.length > 0
+        ? `OK: 已重建 ${healed.length} 个 junction\n- ` + healed.join('\n- ')
+        : 'OK: 全部 link: 依赖 junction 健康（无需修复）'
     },
   }))
 
