@@ -31,7 +31,7 @@ import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSy
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
-import { pathToFileURL } from 'node:url'
+import { pathToFileURL, fileURLToPath } from 'node:url'
 
 // ═══════════════════════════════════════════════════════════════════════
 // A: 插件生产线模板（dev_scaffold_plugin）——四种形态骨架：
@@ -840,6 +840,25 @@ export function apply(ctx: AppContext, config: Config): void {
     }
     if (!entryUrl) return `INFO: 缓存中无匹配且磁盘降级失败 "${urlKey}" 的模块`
     const entryUrlFinal = entryUrl
+
+    // ═══ 构建产物新鲜度预检（2026-08-14 index build 事件教训）═══
+    // 重载前检查目标包：lib/client.js 缺失/非 tsdown 产物 → 阻断（重载后
+    // 前端必挂，client-modules rebuilt 只会把坏 bundle 广播出去）；src 比
+    // 产物新（漏构建）→ audit 留痕提醒（mtime 在 git checkout 场景可能
+    // 误报，故只警告不阻断）。
+    try {
+      const base = dirname(dirname(fileURLToPath(entryUrlFinal)))
+      const fresh = buildFreshnessProblems(base)
+      if (fresh.block.length > 0) {
+        auditLog('reload-blocked-stale', `${urlKey}: ${fresh.block.join('; ')}`)
+        return 'ERROR: 重载前构建产物预检失败（先修复再重载，否则前端必挂）：\n- ' + fresh.block.join('\n- ')
+          + '\n修复：npm run build:all（host + client 两步构建）→ 再重载'
+      }
+      if (fresh.warn.length > 0) {
+        auditLog('reload-stale-artifacts', `${urlKey}: ${fresh.warn.join('; ')}`)
+        logger.warn('[super-injector] 重载 %s 构建产物可能过期（未阻断）: %s', urlKey, fresh.warn.join('; '))
+      }
+    } catch { /* 目录解析失败不阻断（其余预检兜底） */ }
 
     // ═══ 重启器（自重载专用）：自杀后脱离自身 fiber 完成重建 ═══
     // 自重载时 dispose 会把当前 fiber（含本工具）销毁，随后的重建代码
@@ -1988,6 +2007,80 @@ export function apply(ctx: AppContext, config: Config): void {
     return problems
   }
 
+  /**
+   * 构建产物新鲜度校验（2026-08-14 index build 事件教训：漏构建 client /
+   * lib 过期 → 前端 bundle script failed to load + host 跑旧代码）。
+   * 注入/重载/恢复/构建后四路共用：
+   *  - block：必崩项——声明了 dsh.client 但 lib/client.js 缺失，或非 tsdown
+   *    产物（缺 __ModuleLoader__ 特征，可能被 tsc 覆盖/手改）→ 阻断操作；
+   *  - warn：质量项——src 比产物新（疑似漏 build / build:client）→ 提示。
+   *    纯 mtime 比较在 git checkout 场景可能误报（检出的 src 时间戳更新），
+   *    故只警告不阻断。无 src 的目录（纯 dist 发布形态）跳过新鲜度。
+   */
+  function buildFreshnessProblems(base: string): { block: string[]; warn: string[] } {
+    const block: string[] = []
+    const warn: string[] = []
+    try {
+      const pkgPath = join(base, 'package.json')
+      if (!existsSync(pkgPath)) return { block, warn }
+      const pkg = JSON.parse(readFileSync(pkgPath, 'utf8')) as Record<string, unknown>
+      const hasClient = !!(pkg.dsh as Record<string, unknown> | undefined)?.client
+      // src 最新 mtime（host 与 client 分开算，避免只改 host 误报 client 过期）
+      const srcDir = join(base, 'src')
+      let hostLatest = 0
+      let clientLatest = 0
+      const walk = (dir: string, onFile: (p: string) => void): void => {
+        let entries: import('node:fs').Dirent[]
+        try { entries = readdirSync(dir, { withFileTypes: true }) } catch { return }
+        for (const f of entries) {
+          const p = join(dir, f.name)
+          if (f.isDirectory()) walk(p, onFile)
+          else if (/\.(ts|tsx)$/.test(f.name)) onFile(p)
+        }
+      }
+      if (existsSync(srcDir)) {
+        walk(srcDir, (p) => {
+          try {
+            const mt = statSync(p).mtimeMs
+            const norm = p.replace(/\\/g, '/')
+            if (norm.includes('/client/')) {
+              if (mt > clientLatest) clientLatest = mt
+            } else if (mt > hostLatest) hostLatest = mt
+          } catch { /* 单文件读不到跳过 */ }
+        })
+      }
+      // host 产物
+      const libIndex = join(base, 'lib', 'index.js')
+      if (existsSync(libIndex)) {
+        let mt = 0
+        try { mt = statSync(libIndex).mtimeMs } catch { /* 跳过 */ }
+        if (hostLatest > 0 && hostLatest - mt > 8000) {
+          warn.push('lib/index.js 过期（src 修改晚于构建 8s+，疑似漏 npm run build——重载会跑旧代码）')
+        }
+      }
+      // client 产物
+      if (hasClient) {
+        const libClient = join(base, 'lib', 'client.js')
+        if (!existsSync(libClient)) {
+          block.push('lib/client.js 不存在（package.json 声明了 dsh.client 但没构建 client——先 npm run build:client，否则前端必挂）')
+        } else {
+          try {
+            const content = readFileSync(libClient, 'utf8')
+            if (!content.includes('__ModuleLoader__')) {
+              block.push('lib/client.js 不是 tsdown bundle（缺 __ModuleLoader__ 特征——可能被 tsc 覆盖或手改，重新 npm run build:client）')
+            }
+            let mt = 0
+            try { mt = statSync(libClient).mtimeMs } catch { /* 跳过 */ }
+            if (clientLatest > 0 && clientLatest - mt > 8000) {
+              warn.push('lib/client.js 过期（src/client 修改晚于构建 8s+，疑似漏 npm run build:client——前端会加载旧 UI）')
+            }
+          } catch { /* 读不到跳过 */ }
+        }
+      }
+    } catch { /* 读不到按健康处理 */ }
+    return { block, warn }
+  }
+
   async function restore(): Promise<void> {    // ① profile bundle junction 自愈：断电/强制关机后 junction 悬空 → 重建。
     //    （dev_install_package 装的 bundle 在 profile package.json，junction 失效会导致装配失败——此前无覆盖，需手动修）
     try {
@@ -2028,10 +2121,14 @@ export function apply(ctx: AppContext, config: Config): void {
         // ⚠️ 恢复前 client 骨架校验（pixel-forge 事件教训：坏 client 插件
         // 恢复 → apply 失败 → 整个 HARNESS 启动失败——用户被迫手动修）。
         // 有问题的插件跳过恢复 + 审计（保留 registry——修复后下次启动恢复）。
+        // 2026-08-14 追加：构建产物新鲜度 block 项同样跳过（漏构建 client 的
+        // 插件恢复 = 前端必挂）。
         const problems = clientSkeletonProblems(e.dir)
-        if (problems.length > 0) {
-          auditLog('restore-skip-bad-client', `${e.name} client 骨架问题，跳过恢复: ${problems.join('; ')}`)
-          logger.warn('[super-injector] 恢复 %s 跳过（client 骨架问题）: %s', e.name, problems.join('; '))
+        const fresh = buildFreshnessProblems(e.dir)
+        const block = [...problems, ...fresh.block]
+        if (block.length > 0) {
+          auditLog('restore-skip-bad-client', `${e.name} client 骨架/构建产物问题，跳过恢复: ${block.join('; ')}`)
+          logger.warn('[super-injector] 恢复 %s 跳过（client 骨架/构建产物问题）: %s', e.name, block.join('; '))
           continue
         }
         await inject(e.dir)
@@ -2168,10 +2265,19 @@ export function apply(ctx: AppContext, config: Config): void {
       // 漏 inject 的 client 注入后 Tab 必挂）③restore 恢复路径同样校验
       // （pixel-forge 事件：坏 client 插件在 registry → 新会话 autoRestore
       // 恢复 → client apply 失败 → 整个 HARNESS 启动失败——用户被迫手动修）
+      // 2026-08-14 二次升级（index build 事件教训）：追加构建产物新鲜度校验
+      // ——lib/client.js 缺失/非 tsdown 产物 → 阻断（前端必挂）；src 比产物
+      // 新（漏构建）→ 警告（注入不阻断，但 audit 留痕提醒）。
       const problems = clientSkeletonProblems(resolve(dir))
-      if (problems.length > 0) {
-        return 'ERROR: 注入前校验发现 client 骨架问题（已阻断——缺 inject 的 client 注入后 Tab 必挂）：\n- ' + problems.join('\n- ')
-          + '\n修复：参照脚手架模板（dev_scaffold_plugin ui-panel/hybrid）补上 export const inject = [\'slots\'] → 重新 build → 再注入'
+      const fresh = buildFreshnessProblems(resolve(dir))
+      const block = [...problems, ...fresh.block]
+      if (block.length > 0) {
+        return 'ERROR: 注入前校验发现 client 骨架/构建产物问题（已阻断——缺 inject 的 client 注入后 Tab 必挂，缺 client bundle 前端必挂）：\n- ' + block.join('\n- ')
+          + '\n修复：参照脚手架模板补骨架 → npm run build:all（host + client 两步构建）→ 再注入'
+      }
+      if (fresh.warn.length > 0) {
+        auditLog('inject-stale-artifacts', `${dir}: ${fresh.warn.join('; ')}`)
+        logger.warn('[super-injector] 注入 %s 构建产物可能过期（未阻断）: %s', dir, fresh.warn.join('; '))
       }
       return withOpLock(() => inject(dir))
     },
@@ -2574,6 +2680,16 @@ export function apply(ctx: AppContext, config: Config): void {
       const tgz = join(pluginDir, tgzMatch[1])
       if (!existsSync(tgz)) return 'ERROR: tgz 未生成（' + tgz + '）'
       steps.push(`打包完成: ${tgz}`)
+      // 4. 构建后自检（2026-08-14 index build 事件教训）：刚构建完理应全部
+      //    新鲜——若仍有 block/warn 说明构建步骤被跳过（如无 build:client 脚本
+      //    却声明了 client），当场报错避免把坏产物带进注入/发布。
+      const fresh = buildFreshnessProblems(pluginDir)
+      if (fresh.block.length > 0) {
+        return `ERROR: 构建完成但产物校验失败（产物不能用于注入/发布）：\n- ${fresh.block.join('\n- ')}`
+      }
+      if (fresh.warn.length > 0) {
+        steps.push(`⚠️ 产物新鲜度警告（建议核查）: ${fresh.warn.join('; ')}`)
+      }
       auditLog('build', `${String(pkg.name)} → ${tgz}`)
       return 'OK: ' + String(pkg.name) + ' 构建打包完成\n- ' + steps.join('\n- ') + '\n下一步：dev_inject_plugin / dev_release_plugin'
     },
