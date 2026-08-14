@@ -2,6 +2,36 @@
 
 本项目版本与仓库提交对应，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [0.3.2] — 2026-08-15
+
+### 新增（高性能引导：首轮锚定 + 工具 schema 精简）
+
+- **骨架模板自带高性能引导**：`dev_scaffold_plugin` 生成的 toolkit 骨架头部注释新增两条
+  高性能铁律（工具 schema 精简——description 短句化、详解不进 schema；首轮锚定——工具面
+  ≥5 时首轮只露核心 1-2 个、首个 `tool/call` 后恢复全部），`apply()` 末尾附**可启用的首轮
+  锚定实现块**（`system-prompt/assemble` Waterfall 过滤器 + `agent.session.events` 持久化
+  推导晋升，resume 安全，只裁剪本插件工具）
+- **README 规范铁律 5 条 → 7 条**（新增「首轮锚定」「工具 schema 精简」），新增
+  「高性能插件（首轮锚定 · 为什么 & 怎么做）」小节：原理、三步启用、session JSONL 验证法
+- **SPEC 铁律 6 条 → 8 条**，新增第 6 节「性能引导契约」：事件契约（Waterfall 必须
+  `await next()`、`agent` 判空、晋升从持久日志推导、工具执行失败也算晋升）、过滤边界
+  （只裁剪本插件工具）、成本模型（首轮无缓存 prefill 全量计费、17.6 万字符实测、schema
+  面 vs 文本内容的微探针证据）
+
+### 参考与致谢
+
+- 首轮锚定机制源自 **xiaobright** 的
+  [`dsh-anchored-standard`](https://github.com/xiaobright/dsh-anchored-standard)
+  （MIT，两阶段锚定 preset 与 `tool-bootstrap.mjs` 实现，Project2 实测 98/99）
+- 原理分析与统计证据来自 **xiaobright** 的
+  [`modeltest`](https://github.com/xiaobright/modeltest)（V4.1b，frozen：
+  harness 对照分析 / 触发机制实验 / 轨迹统计）
+
+### 验证
+
+- tsc 编译通过；新骨架实测：`dev_scaffold_plugin` 生成文件含铁律注释与锚定块
+- 运行副本（cloud-restore 云源自举）同步 `lib/` 后自重载，前后均 active
+
 ## [0.3.1] — 2026-08-14
 
 ### 修复（pixel-forge 事件根治——坏 client 挂死 HARNESS）

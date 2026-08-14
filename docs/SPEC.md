@@ -146,3 +146,37 @@ job 解出的模块才是"同一个"）。跨副本重载时 registry 语义断�
 4. **patch 永远单一顶层数组**
 5. **预检先于任何自杀/重载**（代码不可加载就保持现状）
 6. **fiber 身份是 callback，跨副本不共享 registry**
+7. **首轮锚定**——插件工具面大时首轮只露核心 1-2 个，首个 `tool/call` 后恢复全部
+8. **工具 schema 精简**——description 短句化，详解不进 schema（目录体积 = 首轮 prefill 成本）
+
+---
+
+## 6. 性能引导契约（首轮锚定，源码依据）
+
+依据：`dsh-system-prompt`（Waterfall 事件）、`dsh-session`（事件源日志）、
+`dsh-agent`（AssembleContext 合并注入）。全部 API 面已在 DSH 0.1.0-rc.6 验证。
+
+### 6.1 事件契约
+
+- `system-prompt/assemble` 是 **Waterfall**：监听器必须 `await next()` 拿到组装结果，
+  然后对 `assembled.tools` 做过滤后返回——跳过 next 会切断下游（工具提供方/排序）。
+- `AssembleContext.agent` 由 `dsh-agent` 通过模块合并注入（`agent?: Agent`，
+  diagnostics 场景缺省）——必须判空。
+- 晋升状态从 `agent.session.events`（持久事件源）推导：存在任一 `type === 'tool/call'`
+  即晋升。**工具执行失败也算已持久化**，下一步照常晋升；首次响应未调用工具则不晋升。
+  由于阶段来自持久日志而非内存标志，resume/reload 天然不丢状态。
+- 目录只应变化一次（首轮 2 项 → 完整目录），首↔次请求之间有一次前缀缓存变化。
+
+### 6.2 过滤边界
+
+- **只裁剪本插件注册的工具**：`MINE` 集合之外的工具原样放行——首轮锚定是插件级
+  行为，不改变宿主目录。
+- 首轮保留集 = 平台无关的核心工具（本插件 1-2 个），不强制含 shell/read——
+  anchored-standard 的 `pwsh/read` 是 preset 级快照的配置选择，不是本契约要求。
+
+### 6.3 成本模型（schema 精简的依据）
+
+- 首轮请求是无前缀缓存的**全量 prefill**，工具目录逐字符计费且参与注意力分配；
+  实测 6 插件 description 合计可到 **17.6 万字符**（缓存命中比未命中便宜约 10 倍）。
+- 微探针（modeltest 触发机制实验）证明：影响轨迹的是**可调用的 schema 面**，
+  把目录文字塞进 user message 无效——所以精简 schema 不是可选项，是性能项。

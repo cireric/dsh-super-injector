@@ -185,6 +185,27 @@ export function apply(ctx: AppContext): void {
 3. **client bundle 需单独构建**（tsdown → lib/client.js）——UI 形态两步构建
 4. **提示词注入遵守缓存原则**：静态文本 + order 靠前（静态到头）；动态内容走消息尾（动态到尾）；严禁动态拼接进 system
 5. **自检**：改完代码跑一次 `dev_self_test`，确保注入/重载/自重载/预检/卸载全链路不退化
+6. **首轮锚定**（V4 Pro 实测，参考 [dsh-anchored-standard](https://github.com/xiaobright/dsh-anchored-standard)，Project2 98/99）：工具面大（≥5 个）时，首轮请求只暴露最核心的 1-2 个工具，首个 `tool/call` 后恢复全部——首轮请求结构决定整条会话的策略轨迹，锚定训练对齐的窄工具面再放开，能力不损。实现：`system-prompt/assemble` Waterfall 过滤器（骨架已自带，见 dev_scaffold_plugin）
+7. **工具 schema 精简**：description 用短句点明用途，详解放 tool result / 静态引导文本，不要写进 schema——工具目录按字符计费进首轮 prefill，实测 6 插件可膨胀到 17.6 万字符，稀释首轮注意力且无缓存 prefill 最贵（缓存命中便宜 10 倍）
+
+### 高性能插件（首轮锚定 · 为什么 & 怎么做）
+
+**为什么**：DeepSeek V4 Pro 的行为策略在首轮请求处被「完整 system prompt + 工具 schema 分布」强条件化。同题同环境：minimal（2 工具）99/96，standard（25 工具）91，两阶段锚定 98/99——先窄后宽，能力与完整工具面兼得。微探针证明起作用的是**可调用的 schema 面**（action space），不是看见工具名文本；工具目录只变化一次（首↔次请求之间有一次前缀缓存变化，首轮无缓存 prefill 最贵）。
+
+**怎么做（骨架自带，三步启用）**：
+1. `dev_scaffold_plugin` 生成的 toolkit 骨架 apply() 末尾有注释好的锚定块；
+2. `inject` 数组加 `'systemPrompt'`，把 `MINE` 换成你的工具名集合、`CORE` 换成首轮要保留的核心工具；
+3. 首次工具调用后自动恢复全部工具，resume/reload 不丢状态（阶段从持久 session events 推导）。
+
+**验证**：导出 session JSONL 看 `request/header`——第一份只含核心工具，首次工具调用后的下一份变更 header 含完整目录，此后保持。
+
+**参考与致谢**：本引导中的「首轮锚定」机制与统计证据，参考了 **xiaobright** 的开源工作——
+[`dsh-anchored-standard`](https://github.com/xiaobright/dsh-anchored-standard)（MIT，
+两阶段锚定 preset 与 `tool-bootstrap.mjs` 实现，Project2 实测 98/99，首轮 2 工具 → 首次
+工具调用后恢复 25 项完整 Standard 工具）与
+[`modeltest`](https://github.com/xiaobright/modeltest)（V4.1b 评测套件：同环境对照
+minimal 99/96 vs standard 91 vs 两阶段 98/99、触发机制微探针、轨迹统计）。骨架中的锚定
+实现即该 preset 过滤器的插件级移植（只裁剪本插件工具）。
 
 ## 典型工作流
 
