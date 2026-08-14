@@ -981,6 +981,19 @@ export function apply(ctx: AppContext, config: Config): void {
               }
               throw error
             }
+            // ⚠️ client 表补扫（实测）：reboot 的新 fiber 经 rebootCtx.registry
+            // 创建（parent 无 Entry.key）——client-modules 的 internal/plugin
+            // 监听读不到 fiber.entry → 不 processOne → 注入器自身的 client
+            // （settings 插件管理页）不注册。startWith 成功后显式补扫——
+            // 必须走 rebootCtx（ctx.root 活跃；注入器 ctx 自杀后 inactive，
+            // refreshClientRow 内部用它取 clientModules 会静默失败）。
+            try {
+              const name = String(entry.options.name ?? '')
+              if (name) {
+                const cm = rebootCtx.get('clientModules') as { processOne?: (id: string) => unknown } | undefined
+                if (cm && typeof cm.processOne === 'function') cm.processOne(name)
+              }
+            } catch { /* client 补扫失败不阻塞 */ }
             logger.info('[super-injector] 重启器重建完成（REPLACE 语义，fiber=%s）', entry.fiber?.state)
           } catch (error) {
             logger.error('[super-injector] 重启器重建失败: %s', String(error))
@@ -2813,4 +2826,87 @@ export function apply(ctx: AppContext, config: Config): void {
   logger.info('[super-injector] 就绪：watch %d 目录（%dms），autoRestore=%s', watches.length, intervalMs, String(config.autoRestore))
   // B: 每次装配后仲裁——幽灵压制官方时自动清理恢复（含历史残留场景）
   arbitrateOfficial()
+
+  // ═══════════════════════════════════════════════════════════════════
+  // 插件管理 UI API（settings.section 页面后端）
+  // 端点：GET /list（registry+状态+统计）、POST /uninstall{match}、
+  //       POST /inject{dir}、POST /ingest{dir,title}（新建会话内化）
+  // ═══════════════════════════════════════════════════════════════════
+  async function readBody(req: any): Promise<string> {
+    const chunks: Buffer[] = []
+    for await (const c of req) chunks.push(Buffer.from(c))
+    return Buffer.concat(chunks).toString('utf8')
+  }
+
+  /** 新建 agent 会话，把任意目录内化成插件（AI 自主完成分析→脚手架→构建→注入）。 */
+  async function startIngest(dir: string, title?: string): Promise<string> {
+    const abs = resolve(dir)
+    if (!existsSync(abs)) return 'ERROR: 目录不存在: ' + abs
+    const agentsSvc = ctx.get('agents') as { create?: (options: any) => Promise<{ agent: { id: string } }> } | undefined
+    if (!agentsSvc || typeof agentsSvc.create !== 'function') return 'ERROR: agents 服务不可用（无法新建会话）'
+    const sessionId = 'ingest-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+    const prompt = `请把目录 ${abs} 里的内容**内化成 DSH 插件**。步骤：①分析内容（代码/脚本/配置/文档/资源，任意形态）②决定插件形态（toolkit 工具包 / daemon-loop 守护循环 / ui-panel UI 面板 / hybrid 混合）③用 dev_scaffold_plugin 生成骨架或直接编写插件包（package.json/tsconfig/scripts/build.sh/src）④dev_build_plugin 构建⑤dev_inject_plugin 注入⑥dev_self_test 自检确认。若内容本身已是可注入插件包（含 package.json+lib/）则直接构建注入。完成后汇报插件名与用途。`
+    const seed = [{
+      type: 'user/message',
+      seq: 0,
+      time: Date.now(),
+      data: {
+        message: {
+          kind: 'user',
+          source: { kind: 'user' },
+          content: [{ type: 'text', text: prompt }],
+        },
+      },
+    }]
+    const handle = await agentsSvc.create({
+      sessionId,
+      meta: { cwd: process.cwd() },
+      seed,
+    })
+    auditLog('ingest-session', `${abs} → 会话 ${handle.agent.id}（${title ?? '内化插件'}）`)
+    return `OK: 内化会话已创建（${handle.agent.id}）——AI 正在把内容变成插件，会话列表可见`
+  }
+
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'prefix',
+    path: '/super-injector/api',
+    handler: async (req: any, res: any) => {
+      const send = (code: number, obj: unknown): void => {
+        res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify(obj))
+      }
+      try {
+        const url = new URL(req.url ?? '/', 'http://localhost')
+        const path = url.pathname.replace(/^\/super-injector\/api/, '') || '/'
+        if (req.method === 'GET' && path === '/list') {
+          const entries = readRegistry().map((e) => ({ ...e, active: hasActiveEntry(e.name) }))
+          return send(200, { ok: true, entries, stats: opStats, clientDeclared: !!process.env.DSH_WEB })
+        }
+        if (req.method === 'POST' && path === '/uninstall') {
+          const body = JSON.parse(await readBody(req))
+          const match = String(body?.match ?? '').trim()
+          if (!match) return send(400, { ok: false, error: 'match 必填' })
+          const result = await uninject(match)
+          return send(200, { ok: true, result })
+        }
+        if (req.method === 'POST' && path === '/inject') {
+          const body = JSON.parse(await readBody(req))
+          const dir = String(body?.dir ?? '').trim()
+          if (!dir) return send(400, { ok: false, error: 'dir 必填' })
+          const result = await inject(dir)
+          return send(200, { ok: true, result })
+        }
+        if (req.method === 'POST' && path === '/ingest') {
+          const body = JSON.parse(await readBody(req))
+          const dir = String(body?.dir ?? '').trim()
+          if (!dir) return send(400, { ok: false, error: 'dir 必填（要内化成插件的文件夹路径）' })
+          const result = await startIngest(dir, String(body?.title ?? ''))
+          return send(200, { ok: true, result })
+        }
+        return send(404, { ok: false, error: 'not found: ' + path })
+      } catch (e) {
+        return send(500, { ok: false, error: String(e instanceof Error ? e.message : e) })
+      }
+    },
+  }), 'super-injector: plugin-manager-api')
 }
