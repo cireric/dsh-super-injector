@@ -54,6 +54,7 @@ function fetchJson(path: string, init?: RequestInit): Promise<any> {
 export function apply(ctx: ClientContext): void {
   ctx.effect(() => ctx.slots.inject('settings.section', () =>
     ctx.slots.register({
+      name: 'settings.section',
       id: 'super-injector-plugins',
       order: 50,
       label: () => '插件',

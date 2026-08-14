@@ -1976,7 +1976,14 @@ export function apply(ctx: AppContext, config: Config): void {
   /** 启动自动恢复：① bundle junction 断电自愈（profile packages 的 link:）→ ② 注入清单逐个重新注入。 */
   /** client 骨架校验（注入前 + autoRestore 恢复前共用——pixel-forge 事件教训：
    * 坏 client 插件在 registry → 新会话恢复 → apply 失败 → HARNESS 启动失败）。
-   * 返回问题列表（空 = 健康）。lib 与 src 双检查（只有 lib 无 src 不绕过）。 */
+   * 返回问题列表（空 = 健康）。lib 与 src 双检查（只有 lib 无 src 不绕过）。
+   * ⚠️ slot 白名单（2026-08-14 dsh-external-plugins 事件教训）：注册的 slot 名
+   * 必须位于已知合法集合内——早期只认 conversation.view，导致 settings.plugin.item
+   * 等设置页卡片被误判为坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。 */
+  const KNOWN_SLOTS = ['conversation.view', 'settings.plugin.item', 'settings.plugins.tab', 'settings.section', 'settings.general.item', 'conversation.session.header.actions', 'conversation.session.header.utilities', 'conversation.input.dock', 'conversation.composer.dock', 'sidebar.footer.action', 'shell.overlay']
+  const SLOT_ALT = KNOWN_SLOTS.map((s) => s.replace(/\./g, '\\.')).join('|')
+  const REGISTER_NAME = new RegExp(`register\\(\\{[\\s\\S]*?name:\\s*['"](${SLOT_ALT})['"]`)
+
   function clientSkeletonProblems(base: string): string[] {
     const problems: string[] = []
     try {
@@ -1988,8 +1995,8 @@ export function apply(ctx: AppContext, config: Config): void {
         if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
           problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
         }
-        if (!/name:\s*['"]conversation\.view['"]/.test(lib)) {
-          problems.push("lib/client.js 的 register 缺 name: 'conversation.view'（= slot 名）")
+        if (!REGISTER_NAME.test(lib)) {
+          problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
         }
       }
       // 2. 源码骨架（有 src 时）
@@ -1999,8 +2006,8 @@ export function apply(ctx: AppContext, config: Config): void {
         if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
           problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
         }
-        if (!/register\(\{[\s\S]*?name:\s*['"]conversation\.view['"]/.test(src)) {
-          problems.push("slots.register 缺 name: 'conversation.view'（= slot 名，缺了报 slot undefined is not declared）")
+        if (!REGISTER_NAME.test(src)) {
+          problems.push(`slots.register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}——缺了报 slot undefined is not declared）`)
         }
       }
     } catch { /* 读不到文件时跳过 */ }
@@ -2668,8 +2675,8 @@ export function apply(ctx: AppContext, config: Config): void {
           if (!/export const inject\s*=\s*\[[^\]]*'slots'/.test(clientSrc)) {
             problems.push("缺 export const inject = ['slots']（cordis 服务注入声明——apply 用 ctx.slots 必须声明）")
           }
-          if (!/register\(\{[\s\S]*?name:\s*['"]conversation\.view['"]/.test(clientSrc)) {
-            problems.push("slots.register 缺 name: 'conversation.view'（= slot 名，缺了报 slot undefined is not declared）")
+          if (!/register\(\{[\s\S]*?name:\s*['"](?:conversation\.view|settings\.plugin\.item|settings\.plugins\.tab|settings\.section|settings\.general\.item)['"]/.test(clientSrc)) {
+            problems.push("slots.register 缺合法 name（应为已知 slot：conversation.view / settings.plugin.item / settings.plugins.tab / settings.section / settings.general.item——缺了报 slot undefined is not declared）")
           }
           if (problems.length > 0) {
             return 'ERROR: client 骨架校验失败（' + pkgName + '）：\n- ' + problems.join('\n- ')
