@@ -2827,6 +2827,24 @@ export function apply(ctx: AppContext, config: Config): void {
   // B: 每次装配后仲裁——幽灵压制官方时自动清理恢复（含历史残留场景）
   arbitrateOfficial()
 
+  // ⚠️ client-modules pkgMeta 缓存自愈（实测）：bundle 装配的插件在
+  // client-modules 首次扫描时 junction 可能未建 → resolvePkgJson 抛 →
+  // pkgMeta 缓存 null（进程级永久，无官方清缓存 API）→ client 永不注册
+  // （设置页「插件」不出现）。junction 已建立后：清缓存 + 重解析注册。
+  try {
+    const cmSvc = ctx.get('clientModules') as {
+      pkgMeta?: Map<string, unknown>
+      processOne?: (name: string) => unknown
+    } | undefined
+    if (cmSvc?.pkgMeta && typeof cmSvc.pkgMeta.delete === 'function') {
+      cmSvc.pkgMeta.delete('@dsh-external/dsh-super-injector')
+      if (typeof cmSvc.processOne === 'function') {
+        cmSvc.processOne('@dsh-external/dsh-super-injector')
+        auditLog('client-meta-healed', 'client-modules pkgMeta 缓存已清并重解析（设置页插件管理 UI 注册）')
+      }
+    }
+  } catch { /* 缓存自愈失败不阻塞 */ }
+
   // ═══════════════════════════════════════════════════════════════════
   // 插件管理 UI API（settings.section 页面后端）
   // 端点：GET /list（registry+状态+统计）、POST /uninstall{match}、
