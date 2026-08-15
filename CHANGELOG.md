@@ -30,7 +30,7 @@
 - **DSH_HOME 优先（homedir 错家）**：web 进程 homedir 与 DSH_HOME 不一致时（如服务账户/
   跨用户部署），registry/profileNodeModules/日志全错位，junction 建到错误 profile → loader
   找不到包。修复：`process.env.DSH_HOME || homedir()/.dsh` 统一路径（scaffold 模板同步）
-- **自检 tmpDir 去硬编码**：移除 `D:/杨佳禾/dsh/...`（个人路径/用户名），改 DSH_HOME 下
+- **自检 tmpDir 去硬编码**：移除自检临时目录的硬编码个人路径（盘符/用户名不再出现），改 DSH_HOME 下
   稳定目录；`reloadPackage` 磁盘降级改 import **realpath URL**（junction URL 会被 tsx 旧缓存
   命中，tmpDir 迁移后重载失效——实测 uid 不变）
 - **findBash 拒绝 WSL**：Windows 装 WSL 时 System32\bash.exe 抢先 PATH 命中，构建必挂
