@@ -34,4 +34,25 @@ const clientBundle: UserConfig = {
   },
 }
 
-export default [clientBundle] satisfies UserConfig[]
+// 宿主自包含打包：把 @deepseek-ai/dsh-tools / schemastery 等运行时依赖打进
+// lib/index.js（node: 内置模块保持 external）。官方装配（dsh plugin add <目录>）
+// 对目录外 link: 依赖不装 peers，Node 从包真实路径解析不到
+// '@deepseek-ai/dsh-tools' 会整棵 plugin tree 加载失败（issue #1）——
+// 打包后 lib 零外部依赖，任何装配路径都能加载。
+const hostBundle: UserConfig = {
+  entry: { index: 'src/index.ts' },
+  outDir: 'lib',
+  format: 'esm',
+  platform: 'node',
+  dts: false,
+  sourcemap: true,
+  clean: false,
+  deps: {
+    alwaysBundle: (id: string) => !id.startsWith('node:'),
+  },
+  outputOptions: {
+    entryFileNames: 'index.js',
+  },
+}
+
+export default [hostBundle, clientBundle] satisfies UserConfig[]

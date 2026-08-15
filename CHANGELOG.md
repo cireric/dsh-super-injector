@@ -15,6 +15,27 @@
 
 - 文档-only 更新（README/CHANGELOG），无 lib 变更；注入器自检不受影响
 
+### 修复（v0.3.3 实装：Windows 装配实测三 bug + 自包含打包）
+
+- **writePatch/extractPatchBlocks 粘连 bug（patch 串位）**：条目块后的顶格注释被并入前一块，
+  块间重写无换行 → 注释与下一 `- id:` 粘连成一行，`disabled: true` 错挂上一条目（实测：
+  卸载自检插件后注入器行被禁用）。修复：每块保留行尾换行、顶格注释单独成块，块间 join 不再粘连
+- **DSH_HOME 优先（homedir 错家）**：web 进程 homedir 与 DSH_HOME 不一致时（如服务账户/
+  跨用户部署），registry/profileNodeModules/日志全错位，junction 建到错误 profile → loader
+  找不到包。修复：`process.env.DSH_HOME || homedir()/.dsh` 统一路径（scaffold 模板同步）
+- **自检 tmpDir 去硬编码**：移除 `D:/杨佳禾/dsh/...`（个人路径/用户名），改 DSH_HOME 下
+  稳定目录；`reloadPackage` 磁盘降级改 import **realpath URL**（junction URL 会被 tsx 旧缓存
+  命中，tmpDir 迁移后重载失效——实测 uid 不变）
+- **findBash 拒绝 WSL**：Windows 装 WSL 时 System32\bash.exe 抢先 PATH 命中，构建必挂
+  （"适用于 Linux 的 Windows 子系统没有已安装的分发版"）。修复：Git/PortableGit 路径优先，
+  PATH 探测结果含 wsl 标记即拒绝
+- **宿主自包含打包（issue #1 根治）**：tsdown 新增 host bundle，把 @deepseek-ai/dsh-tools /
+  schemastery 等运行时依赖打进 lib/index.js——官方装配（`dsh plugin add <目录>`，link: 依赖
+  不装 peers）不再出现 `Cannot find package '@deepseek-ai/dsh-tools'`，任何装配路径均可加载
+- **杂物清理**：移除源码中的个人引用（engram 注释/默认匹配名）、`dev_reload_package` 描述
+  不再带默认插件名；`Config` 显式标注（junction 依赖下 declaration 报 TS2742）
+- 自检 8/8 PASS（含 patch 写入合法性 + 热重载 uid 变化）
+
 ## [0.3.2] — 2026-08-15
 
 ### 新增（高性能引导：首轮锚定 + 工具 schema 精简）
