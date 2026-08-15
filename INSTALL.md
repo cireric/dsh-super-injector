@@ -142,7 +142,7 @@ dev_fix_patch --check  # 只检查
 
 ### 预防
 
-- 注入器 ≥0.3.2 的 `writePatch` **按 id 幂等去重**——它自己写 patch（卸载 disabled、
+- 注入器 ≥0.3.3 的 `writePatch` **按 id 幂等去重**——它自己写 patch（卸载 disabled、
   self-test 等）不会再制造重复；已有重复也会在写入时顺带清理。
 - 手动 patch 前先确认没有装过注入器；装过就用 `dev_fix_patch --check` 验证。
 
