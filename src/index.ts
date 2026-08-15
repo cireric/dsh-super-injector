@@ -3215,12 +3215,13 @@ export function apply(ctx: AppContext, config: Config): void {
       type: 'user/message',
       seq: 0,
       time: Date.now(),
+      // ⚠️ user/message 的 data 就是消息本体（dsh-session 事件契约），不能包一层
+      // `message:`——嵌套形状会让 router-standard 的 sessionMode 提取不到文本，
+      // 插件生成的首条消息被误判 weak（router-standard issue #1 联动修复）。
       data: {
-        message: {
-          kind: 'user',
-          source: { kind: 'user' },
-          content: [{ type: 'text', text: prompt }],
-        },
+        kind: 'user',
+        source: { kind: 'user' },
+        content: [{ type: 'text', text: prompt }],
       },
     }]
     const handle = await agentsSvc.create({
