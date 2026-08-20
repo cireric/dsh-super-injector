@@ -580,6 +580,11 @@ export function apply(ctx: AppContext, config: Config): void {
   const intervalMs = config.intervalMs ?? 1500
   const watches = config.watches ?? []
 
+  // patch 条目分桶键（writePatch / dev_fix_patch 共享，避免两处复制；字符串键仅作
+  // 索引，id/nested 从值对象读取不做反解析）：顶层与嵌套分桶，跨层同 id 不互删
+  // （2026-08-15 事故——见 extractPatchBlocks 注释）。
+  const bucketKey = (b: { id?: string; nested?: boolean }): string => (b.nested ? 'nested:' : 'top:') + (b.id ?? '')
+
   // ============ 注入清单 ============
   function readRegistry(): RegistryEntry[] {
     try {
@@ -741,14 +746,13 @@ export function apply(ctx: AppContext, config: Config): void {
       const existing = new Set<string>()
       // 顶层与嵌套（insert 子条目 / group config）分桶去重，保留最后一条（与
       // loader 顺序覆盖语义一致）；existing 收集全部 id 供幂等判断
-      const keyOf = (b: { id?: string; fromInsert?: boolean }) => (b.fromInsert ? 'nested:' : 'top:') + b.id
       const seen = new Set<string>()
       const kept: string[] = []
       for (let i = blocks.length - 1; i >= 0; i--) {
         const b = blocks[i]
         if (b.id) {
           existing.add(b.id)
-          const k = keyOf(b)
+          const k = bucketKey(b)
           if (seen.has(k)) continue
           seen.add(k)
         }
@@ -758,9 +762,9 @@ export function apply(ctx: AppContext, config: Config): void {
       if (appendIds.length > 0 && appendIds.every((id) => existing.has(id))) {
         return false
       }
-      // 4. 重写：去重后的现有块 + 追加文本
-      const cleanedTop = kept.join('').replace(/^\s*\[\]\s*$/m, '')
-      writeFileSync(patchFile, cleanedTop + appendText, 'utf8')
+      // 4. 重写：去重后的现有块 + 追加文本（extractPatchBlocks 已前置丢弃顶层
+      // 空数组 `[]`，此处无需再清理）
+      writeFileSync(patchFile, kept.join('') + appendText, 'utf8')
       return true
     } catch {
       return false
@@ -771,12 +775,12 @@ export function apply(ctx: AppContext, config: Config): void {
    * 每块文本保留行尾换行，块间 join 不粘连；顶格注释单独成块（不并入前一条目，
    * 否则重写时注释会与下一条目粘连成一行、后续 `disabled: true` 等错挂条目）。
    * 顶层条目只认第 0 列的 `- id:`；缩进的 `- id:`（insert 子条目 / group config
-   * 子条目）打 fromInsert 标记，去重时与顶层分桶——避免把同 id 的顶层 config 块
+   * 子条目）打 nested 标记，去重时与顶层分桶——避免把同 id 的顶层 config 块
    * （如 dsh-vision 的 baseURL/model）误当重复删掉（2026-08-15 事故）。 */
-  function extractPatchBlocks(content: string): Array<{ id?: string; fromInsert?: boolean; text: string }> {
+  function extractPatchBlocks(content: string): Array<{ id?: string; nested?: boolean; text: string }> {
     const lines = content.split('\n')
-    const blocks: Array<{ id?: string; fromInsert?: boolean; text: string }> = []
-    let current: { id?: string; fromInsert?: boolean; text: string } | null = null
+    const blocks: Array<{ id?: string; nested?: boolean; text: string }> = []
+    let current: { id?: string; nested?: boolean; text: string } | null = null
     for (const line of lines) {
       const trimmed = line.trim()
       if (trimmed === '') {
@@ -787,11 +791,11 @@ export function apply(ctx: AppContext, config: Config): void {
       const idMatch = /^-\s+id:\s*([^\s#]+)/.exec(line)
       if (atCol0 && idMatch) {
         if (current) blocks.push(current)
-        current = { id: idMatch[1], fromInsert: false, text: line + '\n' }
+        current = { id: idMatch[1], nested: false, text: line + '\n' }
       } else if (idMatch) {
         // 缩进 `- id:`：insert/group 的嵌套子条目，去重时与顶层分桶
         if (current) blocks.push(current)
-        current = { id: idMatch[1], fromInsert: true, text: line + '\n' }
+        current = { id: idMatch[1], nested: true, text: line + '\n' }
       } else if (atCol0) {
         // 顶格注释/杂散行：结束当前块，单独成块保留（防止与下一条目粘连）
         if (current) blocks.push(current)
@@ -2585,23 +2589,21 @@ export function apply(ctx: AppContext, config: Config): void {
         const blocks = extractPatchBlocks(content)
         // 顶层与嵌套（insert 子条目 / group config）分桶去重：防止同 id 的顶层
         // config 块被 insert 子条目误判为重复而删掉（2026-08-15 事故）
-        const keyOf = (b: { id?: string; fromInsert?: boolean }) => (b.fromInsert ? 'nested:' : 'top:') + b.id
-        const counts = new Map<string, number>()
+        const counts = new Map<string, { id: string; nested: boolean; count: number }>()
         for (const b of blocks) {
           if (!b.id) continue
-          const k = keyOf(b)
-          counts.set(k, (counts.get(k) ?? 0) + 1)
+          const k = bucketKey(b)
+          const rec = counts.get(k)
+          if (rec) rec.count += 1
+          else counts.set(k, { id: b.id, nested: !!b.nested, count: 1 })
         }
-        const dup: Array<{ id: string; fromInsert: boolean; count: number }> = []
-        for (const [k, n] of counts) {
-          if (n > 1) {
-            const sep = k.indexOf(':')
-            dup.push({ id: k.slice(sep + 1), fromInsert: k.startsWith('nested:'), count: n - 1 })
-          }
+        const dup: Array<{ id: string; nested: boolean; count: number }> = []
+        for (const rec of counts.values()) {
+          if (rec.count > 1) dup.push({ id: rec.id, nested: rec.nested, count: rec.count - 1 })
         }
         if (!dup.length) { out.push(`[${profile}] 健康：无重复 id`); continue }
         fixedAny = true
-        for (const rec of dup) out.push(`[${profile}] 修复：${rec.fromInsert ? '嵌套条目 ' : ''}id "${rec.id}" 重复，删除 ${rec.count} 条（保留最后一条）`)
+        for (const rec of dup) out.push(`[${profile}] 修复：${rec.nested ? '嵌套条目 ' : ''}id "${rec.id}" 重复，删除 ${rec.count} 条（保留最后一条）`)
         if (args.check) continue
         const bak = patchFile + '.bak-' + Date.now()
         try {
@@ -2612,7 +2614,7 @@ export function apply(ctx: AppContext, config: Config): void {
           for (let i = blocks.length - 1; i >= 0; i--) {
             const b = blocks[i]
             if (b.id) {
-              const k = keyOf(b)
+              const k = bucketKey(b)
               if (seen.has(k)) continue
               seen.add(k)
             }

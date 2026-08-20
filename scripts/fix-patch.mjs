@@ -28,7 +28,7 @@ const checkOnly = args.includes('--check')
 
 /** 切分 patch 内容为条目块（`- id:` 及其子行 + 前置注释），返回块列表与杂散行。
  * 顶层条目只认第 0 列的 `- id:`；缩进的 `- id:`（insert 子条目 / group config
- * 子条目）打 fromInsert 标记，去重时与顶层分桶——避免把同 id 的顶层 config 块
+ * 子条目）打 nested 标记，去重时与顶层分桶——避免把同 id 的顶层 config 块
  * （如 dsh-vision 的 baseURL/model）误当重复删掉（2026-08-15 事故）。 */
 function extractBlocks(content) {
   const lines = content.split('\n')
@@ -37,26 +37,26 @@ function extractBlocks(content) {
   for (const line of lines) {
     const trimmed = line.trim()
     if (trimmed === '') {
-      if (current) current.text += '\n' + line
+      if (current) current.text += line + '\n'
       continue
     }
     const atCol0 = line[0] !== ' ' && line[0] !== '\t'
     const idMatch = /^-\s+id:\s*([^\s#]+)/.exec(line)
     if (atCol0 && idMatch) {
       if (current) blocks.push(current)
-      current = { id: idMatch[1], fromInsert: false, text: line }
+      current = { id: idMatch[1], nested: false, text: line + '\n' }
     } else if (idMatch) {
       // 缩进 `- id:`：insert/group 的嵌套子条目，去重时与顶层分桶
       if (current) blocks.push(current)
-      current = { id: idMatch[1], fromInsert: true, text: line }
+      current = { id: idMatch[1], nested: true, text: line + '\n' }
     } else if (atCol0) {
       if (current) blocks.push(current)
       current = null
-      if (!/^\s*\[\]\s*$/.test(trimmed)) blocks.push({ id: undefined, text: line })
+      if (!/^\s*\[\]\s*$/.test(trimmed)) blocks.push({ text: line + '\n' })
     } else if (current) {
-      current.text += '\n' + line
+      current.text += line + '\n'
     } else if (trimmed !== '' && !/^\s*#/.test(trimmed)) {
-      blocks.push({ id: undefined, text: line })
+      blocks.push({ text: line + '\n' })
     }
   }
   if (current) blocks.push(current)
@@ -64,22 +64,21 @@ function extractBlocks(content) {
 }
 
 /** 去重：顶层与嵌套分桶、同 id 保留最后一条（与 loader 顺序覆盖语义一致）；
- * 返回 {text, removed:[{id, fromInsert, count}]}。 */
+ * 返回 {text, removed:[{id, nested, count}]}。 */
 function dedupe(content) {
   const blocks = extractBlocks(content)
-  const keyOf = (b) => (b.fromInsert ? 'nested:' : 'top:') + b.id
+  const bucketKey = (b) => (b.nested ? 'nested:' : 'top:') + b.id
   const counts = new Map()
   for (const b of blocks) {
     if (!b.id) continue
-    const k = keyOf(b)
-    counts.set(k, (counts.get(k) ?? 0) + 1)
+    const k = bucketKey(b)
+    const rec = counts.get(k)
+    if (rec) rec.count += 1
+    else counts.set(k, { id: b.id, nested: !!b.nested, count: 1 })
   }
   const removed = []
-  for (const [k, n] of counts) {
-    if (n > 1) {
-      const sep = k.indexOf(':')
-      removed.push({ id: k.slice(sep + 1), fromInsert: k.startsWith('nested:'), count: n - 1 })
-    }
+  for (const rec of counts.values()) {
+    if (rec.count > 1) removed.push({ id: rec.id, nested: rec.nested, count: rec.count - 1 })
   }
   if (removed.length === 0) return { text: content, removed }
   // 保留最后一条：倒序遍历，从尾部看首次出现者保留
@@ -88,13 +87,13 @@ function dedupe(content) {
   for (let i = blocks.length - 1; i >= 0; i--) {
     const b = blocks[i]
     if (b.id) {
-      const k = keyOf(b)
+      const k = bucketKey(b)
       if (seen.has(k)) continue
       seen.add(k)
     }
     kept.unshift(b.text)
   }
-  return { text: kept.join('\n'), removed }
+  return { text: kept.join(''), removed }
 }
 
 function fixFile(patchFile) {
@@ -152,7 +151,7 @@ function main() {
     }
     fixedAny = true
     for (const rec of r.removed) {
-      console.log(`[${profile}] 修复：${rec.fromInsert ? '嵌套条目 ' : ''}id "${rec.id}" 重复，删除 ${rec.count} 条（保留最后一条）`)
+      console.log(`[${profile}] 修复：${rec.nested ? '嵌套条目 ' : ''}id "${rec.id}" 重复，删除 ${rec.count} 条（保留最后一条）`)
     }
     if (!checkOnly) console.log(`[${profile}] 已重写（原文件备份为 ${patchFile}.bak-<时间戳>）`)
   }
