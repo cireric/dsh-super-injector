@@ -12,7 +12,8 @@
 - **设置页「插件」空白 → 超级模组 / Super Mods**：`settings.section` 按 DSH 契约以
   `register(options, Comp)` 注册真正的 React 组件（移除旧 `options.component` 普通对象——
   React 错误 #130 导致点击空白）；导航名/页面标题随界面语言（zh「超级模组 / 超级模组管理」、
-  en "Super Mods / Super Mods Manager"），不再与官方「插件」页硬编码重名。
+  en "Super Mods / Super Mods Manager"），不再与官方「插件」页硬编码重名；**页面正文亦全
+  locale 化**（列表/按钮/提示/统计走字典与 `{name}` 插值，en 界面不再「导航英、正文中」）。
 - **移植上游 PR #11**（Starfie1d1272）：`dev_plugin_status` 守卫 `loader.internal?.loadCache`
   —— 无 `--expose-internals` 启动（如 DSH Desktop GUI）不再崩溃。
 - **移植上游 PR #20**（Wit-1）：`dev_heal_links` 悬空 junction 删除守卫改用 `lstatSync`
