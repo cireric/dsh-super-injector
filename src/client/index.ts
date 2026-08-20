@@ -4,22 +4,40 @@
  *   - 直接注入：目录已是插件包（package.json + lib/）→ 立即注入
  *   - 内化：任意文件夹 → 新建 agent 会话 → AI 把内容变成插件
  * 通信：同源 fetch → host webServer API（/super-injector/api）
+ *
+ * ⚠️ 契约修复（2026-08）：DSH 的 settings.section 要求 register(options, Comp)
+ * 的**第二参数是真正的 React 组件**。原实现把组件塞进 options.component 且
+ * 返回非 React 对象 → 渲染时组件为 undefined → React 错误 #130 → 设置页
+ * 「插件」空白。此处按契约注册真组件，并改为 locale 感知：导航名随界面语言
+ * （中文「超级模组」/ 英文 "Super Mods"），不再与官方「插件」页硬编码重名。
  */
+import * as React from 'react'
 import type { SlotsService } from '@deepseek-ai/dsh-client-ui-slots'
+
+type Translate = (key: string) => string
 
 type ClientContext = {
   slots: SlotsService
+  effect(callback: () => unknown, label?: string): void
+  locale: {
+    register(namespace: string, dicts: { zh: Record<string, string>; en: Record<string, string> }): unknown
+    bind(namespace: string): Translate
+  }
 }
 
-export const inject = ['slots']
+export const inject = ['slots', 'locale']
 
+const NS = 'dsh-super-injector'
 const API = '/super-injector/api'
 
-function el(tag: string, cls?: string, text?: string): HTMLElement {
-  const e = document.createElement(tag)
-  if (cls) e.className = cls
-  if (text !== void 0) e.textContent = text
-  return e
+/** 字典（zh 为源，en 镜像）。 */
+const zh: Record<string, string> = {
+  nav: '超级模组',
+  title: '超级模组管理（dsh-super-injector）',
+}
+const en: Record<string, string> = {
+  nav: 'Super Mods',
+  title: 'Super Mods Manager (dsh-super-injector)',
 }
 
 const styles = `
@@ -51,116 +69,99 @@ function fetchJson(path: string, init?: RequestInit): Promise<any> {
   }).then((r) => r.json())
 }
 
+/** 真正的 React 函数组件：settings.section 经 register(options, Comp) 渲染；
+ *  t 通过注册的 inject face 注入。 */
+function SuperInjectorPage({ t }: { t: Translate }) {
+  // entries === undefined → 仍在加载
+  const [entries, setEntries] = React.useState<any[]>()
+  const [statsText, setStatsText] = React.useState('')
+  const [msg, setMsg] = React.useState('')
+  const [isErr, setIsErr] = React.useState(false)
+  const [path, setPath] = React.useState('')
+  const [busy, setBusy] = React.useState(false)
+  const [drag, setDrag] = React.useState(false)
+  const [placeholder, setPlaceholder] = React.useState('D:/path/to/folder')
+  const [uninstallName, setUninstallName] = React.useState('')
+
+  const refresh = React.useCallback(() => {
+    fetchJson('/list').then((d) => {
+      if (!d?.ok) { setMsg(JSON.stringify(d)); setIsErr(true); return }
+      const { entries: es, stats: s } = d
+      setEntries(es)
+      setStatsText(`inject ${s?.inject?.ok ?? 0}✓/${s?.inject?.fail ?? 0}✗ · reload ${s?.reload?.ok ?? 0}✓ · uninject ${s?.uninject?.ok ?? 0}✓/${s?.uninject?.fail ?? 0}✗ · 共 ${es.length} 个注入插件`)
+      setMsg('')
+      setIsErr(false)
+    }).catch((err) => { setMsg('加载失败: ' + err); setIsErr(true) })
+  }, [])
+  React.useEffect(() => {
+    refresh()
+    const timer = window.setInterval(refresh, 60000)
+    return () => window.clearInterval(timer)
+  }, [refresh])
+
+  const say = (text: string, err = false): void => { setMsg(text); setIsErr(err) }
+
+  const doAction = (apiPath: string, title: string): void => {
+    const dir = path.trim()
+    if (!dir) { say('请先输入文件夹路径', true); return }
+    setBusy(true)
+    fetchJson(apiPath, { method: 'POST', body: JSON.stringify({ dir, title }) })
+      .then((r) => { say(r?.result ?? JSON.stringify(r), !r?.ok); if (r?.ok) setTimeout(refresh, 1200) })
+      .catch((err) => say('请求失败: ' + err, true))
+      .finally(() => setBusy(false))
+  }
+
+  const uninstall = (name: unknown): void => {
+    setUninstallName(String(name))
+    fetchJson('/uninstall', { method: 'POST', body: JSON.stringify({ match: name }) })
+      .then((r) => say(r?.result ?? JSON.stringify(r), !r?.ok))
+      .catch((err) => say('卸载请求失败: ' + err, true))
+      .finally(() => { setTimeout(() => { setUninstallName(''); refresh() }, 600) })
+  }
+
+  return React.createElement('div', { className: 'spi-page' },
+    React.createElement('style', null, styles),
+    React.createElement('h3', null, t('title')),
+    React.createElement('p', { className: 'spi-stats' }, statsText),
+    React.createElement('div', {
+        className: 'spi-add' + (drag ? ' drag' : ''),
+        onDragOver: (e) => { e.preventDefault(); setDrag(true) },
+        onDragLeave: () => setDrag(false),
+        onDrop: (e) => { e.preventDefault(); setDrag(false); setPlaceholder('浏览器无法读取拖入文件夹的绝对路径——请粘贴路径或使用选择器') },
+      },
+      '拖入文件夹，或输入路径——「内化」= 新建会话让 AI 把内容变成插件；「注入」= 目录已是插件包直接注入',
+      React.createElement('div', { className: 'spi-row' },
+        React.createElement('input', { className: 'spi-input', placeholder: placeholder, value: path, onChange: (e) => setPath(e.target.value) }),
+        React.createElement('button', { className: 'spi-btn', disabled: busy, onClick: () => doAction('/ingest', '内化插件') }, busy ? '处理中…' : '内化（AI 造插件）'),
+        React.createElement('button', { className: 'spi-btn ghost', disabled: busy, onClick: () => doAction('/inject', '直接注入') }, busy ? '处理中…' : '直接注入'),
+      ),
+    ),
+    React.createElement('ul', { className: 'spi-list' },
+      entries === undefined ? null
+      : entries.length === 0
+        ? React.createElement('li', { className: 'spi-item' }, '（暂无注入插件——拖入文件夹或输入路径开始）')
+        : entries.map((e) => React.createElement('li', { className: 'spi-item', key: String(e.name) },
+            React.createElement('span', { className: 'name' }, String(e.name)),
+            React.createElement('span', { className: 'dir' }, String(e.dir)),
+            React.createElement('span', { className: 'st ' + (e.active ? 'on' : 'off') }, e.active ? '运行中' : '未激活'),
+            React.createElement('button', { className: 'spi-btn danger', disabled: uninstallName !== '', onClick: () => uninstall(e.name) }, uninstallName === String(e.name) ? '卸载中…' : '卸载'),
+          )),
+    ),
+    msg ? React.createElement('div', { className: 'spi-msg', style: { display: 'block', borderColor: isErr ? '#d33' : 'var(--theme-border,#333)' } }, msg) : null,
+  )
+}
+
 export function apply(ctx: ClientContext): void {
+  ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-super-injector: dictionaries')
+  const t = ctx.locale.bind(NS)
   ctx.effect(() => ctx.slots.inject('settings.section', () =>
     ctx.slots.register({
       name: 'settings.section',
       id: 'super-injector-plugins',
       order: 50,
-      label: () => '插件',
-      component: () => ({
-        render() {
-          const style = document.createElement('style')
-          style.textContent = styles
-
-          const page = el('div', 'spi-page')
-          const h = el('h3', undefined, '插件管理（dsh-super-injector）')
-          const stats = el('p', 'spi-stats')
-          page.append(style, h, stats)
-
-          // ── 添加区 ──
-          const add = el('div', 'spi-add')
-          add.textContent = '拖入文件夹，或输入路径——「内化」= 新建会话让 AI 把内容变成插件；「注入」= 目录已是插件包直接注入'
-          const row = el('div', 'spi-row')
-          const input = el('input', 'spi-input') as HTMLInputElement
-          input.placeholder = 'D:/path/to/folder'
-          const btnIngest = el('button', 'spi-btn', '内化（AI 造插件）')
-          const btnInject = el('button', 'spi-btn ghost', '直接注入')
-          row.append(input, btnIngest, btnInject)
-          add.append(row)
-          page.append(add)
-
-          // 拖放（浏览器拿不到绝对路径——提示用输入框/选择器）
-          add.addEventListener('dragover', (e) => { e.preventDefault(); add.classList.add('drag') })
-          add.addEventListener('dragleave', () => add.classList.remove('drag'))
-          add.addEventListener('drop', (e) => {
-            e.preventDefault()
-            add.classList.remove('drag')
-            input.placeholder = '浏览器无法读取拖入文件夹的绝对路径——请粘贴路径或使用选择器'
-          })
-
-          // ── 列表 ──
-          const list = el('ul', 'spi-list')
-          page.append(list)
-
-          const msg = el('div', 'spi-msg')
-          msg.style.display = 'none'
-          page.append(msg)
-
-          const say = (text: string, isErr = false): void => {
-            msg.textContent = text
-            msg.style.display = text ? 'block' : 'none'
-            msg.style.borderColor = isErr ? '#d33' : 'var(--theme-border,#333)'
-          }
-
-          const refresh = (): void => {
-            fetchJson('/list')
-              .then((d) => {
-                if (!d?.ok) return say(JSON.stringify(d), true)
-                const { entries, stats: s } = d
-                stats.textContent = `inject ${s?.inject?.ok ?? 0}✓/${s?.inject?.fail ?? 0}✗ · reload ${s?.reload?.ok ?? 0}✓ · uninject ${s?.uninject?.ok ?? 0}✓/${s?.uninject?.fail ?? 0}✗ · 共 ${entries.length} 个注入插件`
-                list.textContent = ''
-                if (!entries.length) {
-                  list.append(el('li', 'spi-item', '（暂无注入插件——拖入文件夹或输入路径开始）'))
-                  return
-                }
-                for (const e of entries) {
-                  const li = el('li', 'spi-item')
-                  const name = el('span', 'name', String(e.name))
-                  const dir = el('span', 'dir', String(e.dir))
-                  const st = el('span', 'st ' + (e.active ? 'on' : 'off'), e.active ? '运行中' : '未激活')
-                  const btn = el('button', 'spi-btn danger', '卸载')
-                  btn.addEventListener('click', () => {
-                    btn.disabled = true
-                    btn.textContent = '卸载中…'
-                    fetchJson('/uninstall', { method: 'POST', body: JSON.stringify({ match: e.name }) })
-                      .then((r) => { say(r?.result ?? JSON.stringify(r), !r?.ok) })
-                      .catch((err) => say('卸载请求失败: ' + err, true))
-                      .finally(() => { btn.disabled = false; btn.textContent = '卸载'; setTimeout(refresh, 600) })
-                  })
-                  li.append(name, dir, st, btn)
-                  list.append(li)
-                }
-              })
-              .catch((err) => say('加载失败: ' + err, true))
-          }
-
-          const doAction = (path: string, label: string): void => {
-            const dir = input.value.trim()
-            if (!dir) { say('请先输入文件夹路径', true); return }
-            btnIngest.disabled = btnInject.disabled = true
-            btnIngest.textContent = btnInject.textContent = '处理中…'
-            say('')
-            fetchJson(path, { method: 'POST', body: JSON.stringify({ dir, title: label }) })
-              .then((r) => { say(r?.result ?? JSON.stringify(r), !r?.ok); if (r?.ok) setTimeout(refresh, 1200) })
-              .catch((err) => say('请求失败: ' + err, true))
-              .finally(() => {
-                btnIngest.disabled = btnInject.disabled = false
-                btnIngest.textContent = '内化（AI 造插件）'
-                btnInject.textContent = '直接注入'
-              })
-          }
-          btnIngest.addEventListener('click', () => doAction('/ingest', '内化插件'))
-          btnInject.addEventListener('click', () => doAction('/inject', '直接注入'))
-
-          refresh()
-          // 60s 轮询刷新（内化会话建好后自动出现）
-          const timer = window.setInterval(refresh, 60000)
-          return {
-            dispose: () => window.clearInterval(timer),
-          }
-        },
-      }),
-    }),
+      label: () => t('nav'),
+      locale: NS,
+      inject: () => ({ t }),
+    }, SuperInjectorPage),
   ), 'super-injector: settings page')
 }
