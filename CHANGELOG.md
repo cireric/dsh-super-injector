@@ -5,6 +5,24 @@
 > **版本以 git tag 为准**：已发布 v0.3.1 / v0.3.3（GitHub Releases 资产）；未打 tag 的
 > 小节为开发史（其内容随下一个发布一并交付）。
 
+## [Unreleased]（开发史，fork：cireric/dsh-super-injector）
+
+### 修复（fork 维护）
+
+- **设置页「插件」空白 → 超级模组 / Super Mods**：`settings.section` 按 DSH 契约以
+  `register(options, Comp)` 注册真正的 React 组件（移除旧 `options.component` 普通对象——
+  React 错误 #130 导致点击空白）；导航名/页面标题随界面语言（zh「超级模组 / 超级模组管理」、
+  en "Super Mods / Super Mods Manager"），不再与官方「插件」页硬编码重名。
+- **移植上游 PR #11**（Starfie1d1272）：`dev_plugin_status` 守卫 `loader.internal?.loadCache`
+  —— 无 `--expose-internals` 启动（如 DSH Desktop GUI）不再崩溃。
+- **移植上游 PR #20**（Wit-1）：`dev_heal_links` 悬空 junction 删除守卫改用 `lstatSync`
+  —— 不再误报「全部健康」，悬空链接能真正重建（重启加载失败有提示）。
+- **移植上游 PR #5**（sujianddd-dev）：checkout 探测补充 `~/deepseek-harness` 候选路径。
+- **移植上游 PR #6**（Cozieur）：`extractPatchBlocks`/`dedupe` 按**顶层 / 嵌套（insert 子条目、
+  group config）分桶去重**（`fromInsert` 标记）—— 修复 `dev_fix_patch` 误删顶层 config 块
+  （dsh-vision baseURL/model/maxTokens 事故）；`src/index.ts` 与 `scripts/fix-patch.mjs`
+  双路径同步，`dev_fix_patch` 描述同步更新。
+
 ## [0.3.3] — 2026-08-15（已发布，git tag v0.3.3）
 
 ### 更新（高性能引导升级为 P1-P23 完整认知）
