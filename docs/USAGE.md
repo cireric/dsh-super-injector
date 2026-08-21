@@ -31,17 +31,15 @@
 
 > 不管用哪种方式装，**只需要装这一次**。装好之后，以后所有插件都用"对 AI 说一句话"的方式动态加载，不用再碰官方配置。
 
-### 方式 A：下载安装包（最省事，推荐）
+### 方式 A：git 直接装配（最省事，推荐）
 
-1. 从 [Releases 页面](https://github.com/cireric/dsh-super-injector/releases) 下载 `dsh-external-dsh-super-injector-<版本>.tgz`；
-2. 解压，得到一个包含 `lib/` 文件夹的插件目录；
-3. 在命令行执行：
+```bash
+dsh plugin --profile web add github:cireric/dsh-super-injector
+```
 
-   ```bash
-   dsh plugin --profile web add <解压出来的目录>
-   ```
+> 走这条取的是源码仓库（不含 `lib/`），但包内 `prepare` 钩子会在安装阶段自动用 tsdown 构建自包含 `lib/`（本地 tsdown 优先，缺失则 `npx` 临时拉取，之后走本地缓存）——**一条命令装完即用**，无需 DSH checkout，只需 bash + node + npm。若构建失败（如离线拉不到 tsdown），改用方式 B 从源码构建。
 
-   想不重启、直接在运行时注入也行——对 AI 说：`dev_inject_plugin <解压目录>`（需要环境里已经有一个常驻的注入器）。
+装完记得**重启 DSH web 进程**，然后向 AI 说一句 `dev_plugin_status`——能看到 `dsh-super-injector`（状态 active）即装成功（与方式 B 同款验证）。
 
 ### 方式 B：从源码 clone + 构建安装（想自己改代码时）
 
@@ -74,15 +72,7 @@ dsh plugin --profile web add <dsh-super-injector目录>
 >
 > 💡 想免 DSH checkout？`npm run prepare`（`scripts/prepare.mjs`）用本地 tsdown 也能打出自包含 `lib/index.js` + `lib/client.js`（tsdown 缺失时 `npx` 临时拉取），适合快速改码验证；但它不走 `build.sh` 的 tsc，不产 `lib/types`，正式装配/发布仍建议走完整链路（`build.sh` + `build:client`）。
 
-### 方式 C：git 直接装配（免本地构建）
-
-```bash
-dsh plugin --profile web add github:cireric/dsh-super-injector
-```
-
-> 走这条取的是源码仓库（不含 `lib/`），但包内 `prepare` 钩子会在安装阶段自动用 tsdown 构建自包含 `lib/`（本地 tsdown 优先，缺失则 `npx` 临时拉取，之后走本地缓存）——**不需要 DSH checkout**，只需 bash + node + npm。若构建失败，改用方式 A 的 Release tgz（预构建产物）。
-
-### 方式 D：手写配置（懂一点配置时用）
+### 方式 C：手写配置（懂一点配置时用）
 
 编辑 `~/.dsh/profiles/web/cordis.patch.yml`，加一段：
 
@@ -101,6 +91,8 @@ dsh plugin --profile web add github:cireric/dsh-super-injector
 
 下面每一节都给出"你说什么 → AI 干什么"的对照。
 
+> 🔑 先分清两个词：**装配** = 当前 web 进程里所有被加载的插件（DSH 本体 + 官方机制装的第三方）；**注入** = 通过本工具"运行时塞进去"的插件（重启后由注入器自动恢复）。下文说的"装插件"默认指注入。
+
 ### 装一个现成的插件（最常用）
 
 > 我拿到一个插件包（解压好的目录，里面有 `package.json` 和 `lib/`），想装进 DSH。
@@ -117,6 +109,13 @@ AI 会完成：链接插件包 → 动态加载 → 双项自检（后台工具 
 
 > 列一下当前装配了哪些插件（`dev_plugin_status`），以及注入清单（`dev_injected_list`）。
 
+状态输出里的统计长这样：`inject 7✓/0✗ · reload 0✓ · uninject 3✓/0✗ · 1 injected mods in total`，是**跨重启、跨会话累计**的成败账本：
+
+- `inject` / `uninject` / `reload` = 对应操作的**成功✓ / 失败✗次数**；其中 `reload` 只统计对普通插件的热重载，注入器自身的"自重载"走另一条通道**不计入**；
+- 重复卸载已卸掉的插件这类"无操作"（no-op）两边都不计，不算失败；
+- `X injected mods in total` = **当前**注入清单的存量（registry.json），不是累计值；
+- 只要有失败，底部「故障审计」会给出最近失败记录（可复盘原因）。
+
 ### 卸载一个插件
 
 对 AI 说：
@@ -124,6 +123,8 @@ AI 会完成：链接插件包 → 动态加载 → 双项自检（后台工具 
 > 用 `dev_uninject_plugin` 把 `xxx` 卸载掉（参数：包名的一部分就行）。
 
 AI 会清理掉这个插件的所有痕迹（工具、监听、路由、界面），同样不用重启。
+
+> 🖱️ 不想记命令也行：**设置页 → Super Mod（插件管理）** 页面能看到注入清单，支持一键卸载。
 
 ### 改代码后让插件生效（开发时）
 
@@ -181,7 +182,7 @@ AI 会：清缓存 → 重新加载 → 重建插件 → 报告前后状态对�
 ### 场景 2：自己从零做一个插件
 
 1. 对 AI 说："用 `dev_scaffold_plugin` 在 `D:/dev/my-plugin` 生成一个 xx 形态（比如工具包）的插件骨架"；
-2. 对 AI 说："用 `dev_build_plugin` 构建"；
+2. 对 AI 说："用 `dev_build_plugin` 构建"（若报「未找到 DSH checkout」：该工具只探测常见路径，给宿主进程设好 `DSH_CHECKOUT` 环境变量指向你的 DSH 源码目录即可；或让 AI 改用 `bash scripts/build.sh` 手动构建）；
 3. 对 AI 说："用 `dev_inject_plugin` 注入" —— **注入即生效**；
 4. 之后每次改完代码 → 构建，约 1.5 秒自动重载；
 5. 成熟了想发布：对 AI 说 "用 `dev_release_plugin` 发布 v0.1.0"。
@@ -197,6 +198,10 @@ A：设计上做了多重保护：加载失败自动回滚（保留旧版本）�
 
 **Q：重启 DSH 之后，装过的插件还在吗？**
 A：在。注入清单会持久化保存，重启后自动归位。唯一例外是"只注入未正式装配"的插件——它们的恢复依赖注入器本身常驻（引导器，装一次就常驻）。
+
+**Q：注入的插件会一直常驻吗？会不会拖慢系统？**
+A：会常驻——运行期一直加载，重启后自动恢复；**唯一的"出口"是主动卸载**（`dev_uninject_plugin` 或设置页一键卸），或是注入器自身被移除、插件源码目录被删。
+但代价要心里有数：**插件的工具会进入每一个会话的工具目录**（首轮请求按目录字符计费，插件多了目录会明显膨胀）；`daemon-loop` 形态的插件是常驻循环，会持续跑任务。所以：临时/演示工具用完就卸；长期要用的插件用 `dev_install_package` 转正式装配，语义更稳、不依赖注入器恢复。
 
 **Q：热重载报错 `duplicate / already registered` 怎么办？**
 A：这说明该插件有资源是"裸注册"的（没挂 `ctx.effect`）。规范的插件注册资源都会挂 `ctx.effect`，热重载才能正确清理重建。这是插件写法问题，不是注入器问题。
