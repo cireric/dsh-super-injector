@@ -71,6 +71,8 @@ dsh plugin --profile web add <dsh-super-injector目录>
 装完记得**重启 DSH web 进程**，然后向 AI 说一句 `dev_plugin_status`——能看到 `dsh-super-injector`（状态 active）即装成功；想更彻底就再跑一次 `dev_self_test`，8 项全部 PASS 说明环境和注入器都健康。
 
 > ⚠️ 为什么第 2 步不是 `pnpm install`？本仓库用的是 npm（只有 `package-lock.json`，没有 `pnpm-lock.yaml`，package.json 也未声明 pnpm）。且 `npm install` 只装开发依赖；真正运行时要用的 `@deepseek-ai/dsh-tools`、`cordis` 等，是由 `scripts/build.sh` 从你的 DSH checkout 里链接进来/打进产物，不靠 `install` 装。
+>
+> 💡 想免 DSH checkout？`npm run prepare`（`scripts/prepare.mjs`）用本地 tsdown 也能打出自包含 `lib/index.js` + `lib/client.js`（tsdown 缺失时 `npx` 临时拉取），适合快速改码验证；但它不走 `build.sh` 的 tsc，不产 `lib/types`，正式装配/发布仍建议走完整链路（`build.sh` + `build:client`）。
 
 ### 方式 C：git 直接装配（免本地构建）
 
@@ -78,7 +80,7 @@ dsh plugin --profile web add <dsh-super-injector目录>
 dsh plugin --profile web add github:cireric/dsh-super-injector
 ```
 
-> 走这条会取源码并在 DSH 侧构建，需要本机具备构建环境（bash + node + npm + DSH checkout 或 `DSH_CHECKOUT`）。
+> 走这条取的是源码仓库（不含 `lib/`），但包内 `prepare` 钩子会在安装阶段自动用 tsdown 构建自包含 `lib/`（本地 tsdown 优先，缺失则 `npx` 临时拉取，之后走本地缓存）——**不需要 DSH checkout**，只需 bash + node + npm。若构建失败，改用方式 A 的 Release tgz（预构建产物）。
 
 ### 方式 D：手写配置（懂一点配置时用）
 
@@ -151,10 +153,11 @@ AI 会：清缓存 → 重新加载 → 重建插件 → 报告前后状态对�
 |---|---|
 | `dev_inject_plugin` | 现场装插件（动态注入，不重启） |
 | `dev_install_package` | 正式装配插件（写进配置，重启后由官方机制接管；开发/生产通用） |
-| `dev_uninject_plugin` | 一键卸载插件，清理干净 |
+| `dev_uninject_plugin` | 一键卸载插件，清理干净（`self=true` 可自举卸载注入器自身） |
 | `dev_injected_list` | 列出已注入的插件清单 |
 | `dev_plugin_status` | 查看当前已装配插件 + 运行状态 + 成功率统计 |
 | `dev_reload_package` | 热重载某个插件（改代码后刷新，失败自动回滚） |
+| `dev_reload_preset` | 预设热更新：改预设代码后新会话直接生效，已运行会话保持旧代 |
 | `dev_clear_routes` | 路由自愈：清除热重载残留的"孤儿路由"，无需重启 |
 | `dev_heal_links` | 链接自愈：重建断掉的插件链接（junction），免重启 |
 | `dev_fix_patch` | 配置修复：清理重复的配置条目（防止启动崩溃），可先 `--check` 只查不改 |
