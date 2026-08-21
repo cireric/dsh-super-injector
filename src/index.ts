@@ -27,7 +27,7 @@ import type SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import type ToolRegistry from '@deepseek-ai/dsh-tools'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import z from 'schemastery'
-import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, rmdirSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
+import { readdirSync, statSync, readFileSync, writeFileSync, existsSync, mkdirSync, symlinkSync, appendFileSync, renameSync, lstatSync, rmSync, readlinkSync, realpathSync } from 'node:fs'
 import { join, relative, dirname, resolve } from 'node:path'
 import { homedir } from 'node:os'
 import { spawnSync } from 'node:child_process'
@@ -2055,7 +2055,10 @@ export function apply(ctx: AppContext, config: Config): void {
       const linkDir = join(profileNodeModules, ...parts)
       try {
         if (existsSync(linkDir)) {
-          rmdirSync(linkDir)
+          // ⚠️ 平台矩阵（实测 macOS）：rmdir() 不跟随符号链接，macOS/Linux 对 symlink 均报 ENOTDIR；
+          // Windows junction 可删但 rmdir 自 Node 16 起废弃。通用解 fs.rm：lstat 语义只删链接本身、
+          // 绝不跟随目标；不加 recursive，真实非空目录会报错可见（守住"只删链接不删目标"）
+          rmSync(linkDir, { force: true });
           steps.push('junction 已删除: ' + linkDir)
         } else {
           steps.push('（junction 不存在）')
