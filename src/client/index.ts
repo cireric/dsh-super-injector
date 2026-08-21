@@ -90,8 +90,9 @@ const styles = `
 .spi-btn:disabled{opacity:.45;cursor:not-allowed}
 .spi-list{list-style:none;margin:0;padding:0}
 .spi-item{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--theme-border,#333);border-radius:8px;margin-bottom:6px}
-.spi-item .name{flex:1;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.spi-item .dir{color:var(--theme-text-secondary,#888);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:40%}
+.spi-item .meta{flex:1;min-width:0;display:flex;flex-direction:column;gap:2px}
+.spi-item .name{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.spi-item .dir{color:var(--theme-text-secondary,#888);font-size:11px;word-break:break-all}
 .spi-item .st{font-size:10px;padding:2px 6px;border-radius:10px}
 .spi-item .st.on{background:rgba(46,204,113,.15);color:#2ecc71}
 .spi-item .st.off{background:rgba(255,193,7,.12);color:#f1c40f}
@@ -185,8 +186,10 @@ function SuperInjectorPage({ t }: { t: Translate }) {
       : entries.length === 0
         ? React.createElement('li', { className: 'spi-item' }, t('emptyList'))
         : entries.map((e) => React.createElement('li', { className: 'spi-item', key: String(e.name) },
-            React.createElement('span', { className: 'name' }, String(e.name)),
-            React.createElement('span', { className: 'dir' }, String(e.dir)),
+            React.createElement('div', { className: 'meta' },
+              React.createElement('span', { className: 'name' }, String(e.name)),
+              React.createElement('span', { className: 'dir' }, String(e.dir)),
+            ),
             React.createElement('span', { className: 'st ' + (e.active ? 'on' : 'off') }, e.active ? t('stateActive') : t('stateInactive')),
             React.createElement('button', { className: 'spi-btn danger', disabled: uninstallName !== '', onClick: () => uninstall(e.name) }, uninstallName === String(e.name) ? t('uninstalling') : t('btnUninstall')),
           )),
