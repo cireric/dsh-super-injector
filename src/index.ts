@@ -1964,7 +1964,19 @@ export function apply(ctx: AppContext, config: Config): void {
     try {
       let linkExists = false
       try { linkExists = lstatSync(linkDir).isSymbolicLink() || lstatSync(linkDir).isDirectory() } catch { /* 不存在 */ }
-      if (!linkExists || !isHealthyLink(linkDir)) {
+      // ⚠️ 真实目录（非链接）= profile 包管理器管理的安装实体：绝不删除（2026-08 事故：dev_inject_plugin
+      // 把 pnpm 装进 profile 的真实包目录 rmSync 掉、换成了自指 junction）。它就是本次要注入的目录 →
+      // 已在位无需建链；否则明确报错，不静默换成链接误导调用者（错误可见）。
+      let ownedRealDir = false
+      try { ownedRealDir = !lstatSync(linkDir).isSymbolicLink() } catch { /* 不存在 */ }
+      if (ownedRealDir) {
+        let sameDir = false
+        try { sameDir = realpathSync(linkDir) === realpathSync(absDir) } catch { /* 解析失败按不同处理 */ }
+        if (!sameDir) {
+          return `ERROR: ${pkgName} 已由 profile 真实安装占用（${linkDir}，非链接）——拒绝覆盖；请先卸载该包，或换一个包名再注入`
+        }
+      }
+      if (!ownedRealDir && (!linkExists || !isHealthyLink(linkDir))) {
         if (linkExists) {
           try { rmSync(linkDir, { recursive: true, force: true }) } catch { /* 删除失败尝试覆盖 */ }
         }
@@ -2083,10 +2095,15 @@ export function apply(ctx: AppContext, config: Config): void {
     return 'OK: 卸载完成\n- ' + steps.join('\n- ')
   }
 
-  /** junction 健康检查：能读目录 = 目标可达（Windows 断电后悬空 junction 的 lstat 仍是链接但读目录抛错）。 */
+  /** junction 健康检查：能读目录 = 目标可达（Windows 断电后悬空 junction 的 lstat 仍是链接但读目录抛错）。
+   *  ⚠️ 真实（非链接）目录视为健康——它们是 profile 包管理器管理的安装实体，绝不能被当成「不健康
+   *  链接」删除重建。来源：dsh-routing-suite PR #65（2026-09-03），standalone 上游从未有过。
+   *  本机实测（2026-09-28）：profile 内有 25 个这样的真实目录（dsh-better-sidebar / dsh-mnemon /
+   *  dsh-mcp-panel / dsh-context …），原来的 return false 会让注入同名包时把整个包目录 rmSync 掉。 */
   function isHealthyLink(p: string): boolean {
     try {
-      if (!lstatSync(p).isSymbolicLink()) return false
+      const st = lstatSync(p)
+      if (!st.isSymbolicLink()) return true
       readdirSync(p)
       return true
     } catch {
@@ -2257,7 +2274,14 @@ export function apply(ctx: AppContext, config: Config): void {
         const scope = name.startsWith('@') ? name.split('/')[0] : null
         const linkDir = join(profileNodeModules, scope ?? '')
         const linkPath = join(linkDir, scope ? name.split('/')[1] as string : name)
-        if (!isHealthyLink(linkPath)) {
+        // ⚠️ link: 依赖却是真实目录 = 与 link: 语义不符（正常应是指向源目录的链接）。isHealthyLink 已把
+        // 真实目录视为健康（不删），这里补一条可见告警，避免静默跳过造成「以为自愈了其实没动」。
+        let realDirHere = false
+        try { realDirHere = !lstatSync(linkPath).isSymbolicLink() } catch { /* 不存在 */ }
+        if (realDirHere) {
+          logger.warn('[super-injector] link: 依赖 %s 在 profile 内是真实目录（非链接）——跳过重建且未删除；确认该处应为链接时请手动处理', name)
+        }
+        if (!realDirHere && !isHealthyLink(linkPath)) {
           // ⚠️ 悬空 junction 的删除守卫必须用 lstatSync 判断链接本身存在：
           // existsSync 跟随链接检查目标，对悬空 junction 返回 false → 残留坏
           // 链接不删除 → 随后 symlinkSync 撞 EEXIST 失败被吞 → 误报全部健康。
