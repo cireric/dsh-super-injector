@@ -2100,10 +2100,19 @@ export function apply(ctx: AppContext, config: Config): void {
    * 返回问题列表（空 = 健康）。lib 与 src 双检查（只有 lib 无 src 不绕过）。
    * ⚠️ slot 白名单（2026-08-14 dsh-external-plugins 事件教训）：注册的 slot 名
    * 必须位于已知合法集合内——早期只认 conversation.view，导致 settings.plugin.item
-   * 等设置页卡片被误判为坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。 */
-  const KNOWN_SLOTS = ['conversation.view', 'settings.plugin.item', 'settings.plugins.tab', 'settings.section', 'settings.general.item', 'conversation.session.header.actions', 'conversation.session.header.utilities', 'conversation.input.dock', 'conversation.composer.dock', 'sidebar.footer.action', 'shell.overlay']
+   * 等设置页卡片被误判为坏骨架；同时白名单外的陌生 slot 名仍视为异常，防 typo。
+   * ⚠️ 2026-09-24 修正误判（实例：dsh-prompt-enhancer P1 生命周期骨架，client 半不注册插槽）：
+   * inject 与 slot 名两项校验改为**蕴含式**——只有真正使用 ctx.slots 的 client 半才受约束。 */
+  // ⚠️ 白名单来源：harness 的 slot-catalog（packages/extensions/cordis-client-runner/src/client/slot-catalog.ts），
+  // 于 2026-09-24 现场派生，共 61 项。手抄的 11 项旧表曾漏掉 50 个真实 slot（含 conversation.input.left），
+  // 导致合法插件被误拦；DSH 升级后应重新派生本表。
+  const KNOWN_SLOTS = ['conversation.approval.detail', 'conversation.chat.assistant-actions', 'conversation.chat.commandview', 'conversation.chat.node', 'conversation.chat.turnTail', 'conversation.composer', 'conversation.composer.bar', 'conversation.composer.dock', 'conversation.hero.agentPreset', 'conversation.hero.brand.mark', 'conversation.hero.workspace', 'conversation.hero.workspace.directoryFlow', 'conversation.input.attachments', 'conversation.input.dock', 'conversation.input.left', 'conversation.input.model', 'conversation.input.overlay', 'conversation.input.plan', 'conversation.input.right', 'conversation.message.images', 'conversation.session', 'conversation.session.header', 'conversation.session.header.actions', 'conversation.session.header.corner', 'conversation.session.header.lineage', 'conversation.session.header.utilities', 'conversation.trajectory.images', 'conversation.view', 'main', 'main.conversation', 'rightbar', 'rightbar.session', 'root', 'settings.action', 'settings.close', 'settings.general.item', 'settings.header', 'settings.models.footer', 'settings.models.provider-card', 'settings.onboarding', 'settings.plugin.item', 'settings.plugins.tab', 'settings.section', 'settings.trigger', 'shell.overlay', 'sidebar', 'sidebar.brand.mark', 'sidebar.brand.name', 'sidebar.footer.action', 'sidebar.panellist', 'sidebar.right.pane.tab', 'sidebar.right.pane.tab.title', 'sidebar.right.tab.document', 'sidebar.right.tab.guide', 'sidebar.right.tab.menu.item', 'sidebar.settings', 'sidebar.workspaces', 'sidebar.workspaces.directoryFlow', 'tool.call.images', 'tool.call.toolview', 'tool.view.cordis']
   const SLOT_ALT = KNOWN_SLOTS.map((s) => s.replace(/\./g, '\\.')).join('|')
-  const REGISTER_NAME = new RegExp(`register\\(\\{[\\s\\S]*?name:\\s*['"](${SLOT_ALT})['"]`)
+  const REGISTER_NAME = new RegExp(`register\\(\\s*\\{[\\s\\S]*?name:\\s*['"](${SLOT_ALT})['"]`)
+
+  /** client 半是否真的使用 ctx.slots：只有这类插件才受 inject / slot 名校验约束。 */
+
+  const USES_SLOTS = /ctx\.slots|slots\.register|slots\.inject/
 
   function clientSkeletonProblems(base: string): string[] {
     const problems: string[] = []
@@ -2113,10 +2122,11 @@ export function apply(ctx: AppContext, config: Config): void {
       const libClient = join(base, 'lib', 'client.js')
       if (existsSync(libClient)) {
         const lib = readFileSync(libClient, 'utf8')
-        if (!/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
+        const libUsesSlots = USES_SLOTS.test(lib)
+        if (libUsesSlots && !/inject\s*=\s*\[[^\]]*['"]slots['"]/.test(lib) && !/inject\s*:\s*\[[^\]]*['"]slots['"]/.test(lib)) {
           problems.push('lib/client.js 缺 inject 含 slots（apply 用 ctx.slots 必须声明——cordis 服务注入契约）')
         }
-        if (!REGISTER_NAME.test(lib)) {
+        if (libUsesSlots && !REGISTER_NAME.test(lib)) {
           problems.push(`lib/client.js 的 register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}）`)
         }
       }
@@ -2124,10 +2134,11 @@ export function apply(ctx: AppContext, config: Config): void {
       const clientSrcPath = join(base, 'src', 'client', 'index.ts')
       if (existsSync(clientSrcPath)) {
         const src = readFileSync(clientSrcPath, 'utf8')
-        if (!/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
+        const srcUsesSlots = USES_SLOTS.test(src)
+        if (srcUsesSlots && !/export const inject\s*=\s*\[[^\]]*['"]slots['"]/.test(src)) {
           problems.push("src/client/index.ts 缺 export const inject = ['slots']（apply 用 ctx.slots 必须声明，否则报 cannot get property 'slots' without inject）")
         }
-        if (!REGISTER_NAME.test(src)) {
+        if (srcUsesSlots && !REGISTER_NAME.test(src)) {
           problems.push(`slots.register 缺合法 name（应为已知 slot：${KNOWN_SLOTS.join(' / ')}——缺了报 slot undefined is not declared）`)
         }
       }
@@ -2930,7 +2941,7 @@ export function apply(ctx: AppContext, config: Config): void {
           if (!/export const inject\s*=\s*\[[^\]]*'slots'/.test(clientSrc)) {
             problems.push("缺 export const inject = ['slots']（cordis 服务注入声明——apply 用 ctx.slots 必须声明）")
           }
-          if (!/register\(\{[\s\S]*?name:\s*['"](?:conversation\.view|settings\.plugin\.item|settings\.plugins\.tab|settings\.section|settings\.general\.item)['"]/.test(clientSrc)) {
+          if (!/register\(\s*\{[\s\S]*?name:\s*['"](?:conversation\.view|settings\.plugin\.item|settings\.plugins\.tab|settings\.section|settings\.general\.item)['"]/.test(clientSrc)) {
             problems.push("slots.register 缺合法 name（应为已知 slot：conversation.view / settings.plugin.item / settings.plugins.tab / settings.section / settings.general.item——缺了报 slot undefined is not declared）")
           }
           if (problems.length > 0) {
